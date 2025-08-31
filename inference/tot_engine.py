@@ -60,11 +60,15 @@ class ToTEngine:
         # Full dialogue history (pure multi-turn)
         self.messages: List[Dict[str, str]] = []
 
-    def _chat_to_json(self) -> Dict[str, Any]:
+    def _chat_to_json(self, messages: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
         """
-        Send self.messages to the LLM and parse a strict JSON response.
+        Send messages (or self.messages if None) to the LLM and parse a strict JSON response.
         On failure, return a safe terminate decision.
+        Only append assistant content to self.messages when messages is None (global dialogue).
         """
+        use_global = messages is None
+        msgs = self.messages if use_global else messages
+
         if self.client is None:
             # Offline fallback
             dummy = {
@@ -77,18 +81,25 @@ class ToTEngine:
                 "direct_answer": None,
                 "confidence": 0.3,
             }
-            # Also append dummy assistant message to keep dialogue shape
-            self.messages.append({"role": "assistant", "content": json.dumps(dummy, ensure_ascii=False)})
+            # Keep dialogue shape only for global history
+            if use_global:
+                self.messages.append({"role": "assistant", "content": json.dumps(dummy, ensure_ascii=False)})
+            else:
+                msgs.append({"role": "assistant", "content": json.dumps(dummy, ensure_ascii=False)})
             return dummy
 
         resp = self.client.chat.completions.create(
             model=self.llm_model,
             temperature=self.temperature,
-            messages=self.messages,
+            messages=msgs,
         )
         text = resp.choices[0].message.content.strip()
-        # Append assistant message to history
-        self.messages.append({"role": "assistant", "content": text})
+
+        # Append assistant message to history only if using the global thread
+        if use_global:
+            self.messages.append({"role": "assistant", "content": text})
+        else:
+            msgs.append({"role": "assistant", "content": text})
 
         try:
             data = json.loads(text)
@@ -104,7 +115,13 @@ class ToTEngine:
                     except Exception:
                         continue
             if data is None:
-                data = {"decision": "terminate", "rationale": "JSON parse failure", "proposed_paths": [], "direct_answer": None, "confidence": 0.0}
+                data = {
+                    "decision": "terminate",
+                    "rationale": "JSON parse failure",
+                    "proposed_paths": [],
+                    "direct_answer": None,
+                    "confidence": 0.0,
+                }
 
         data.setdefault("proposed_paths", [])
         data.setdefault("direct_answer", None)
@@ -155,7 +172,7 @@ class ToTEngine:
             {"role": "user", "content": build_root_user_prompt(meta, question, max_paths=self.per_expand_limit)},
         ]
 
-        # Root planning
+        # Root planning (uses global dialogue)
         root_decision = self._chat_to_json()
         nodes: Dict[str, PathNode] = {}
         root_paths: List[str] = []
@@ -174,7 +191,10 @@ class ToTEngine:
         final_answer = None
         terminated = False
 
-        # Sequential expansion (dialogue-driven)
+        # Create a snapshot of root dialogue history to use as base for each node
+        root_history = list(self.messages)
+
+        # Sequential expansion (dialogue-driven) with per-node local context
         queue = list(root_paths)
 
         while queue and not terminated:
@@ -187,18 +207,21 @@ class ToTEngine:
             clip_res = clip_video_segment(video_path, node.start_s, node.end_s, workdir=self.workdir)
             node.clip_result = clip_res
 
-            # Add the tool result to conversation as assistant content
+            # Build a local message thread for this node starting from the root snapshot
+            local_messages: List[Dict[str, str]] = list(root_history)
+
+            # Add the tool result to conversation as assistant content (local only)
             tool_msg = (
                 f"[Tool Result] Clipped segment: path={clip_res.path}, "
                 f"time={node.start_s:.2f}-{node.end_s:.2f}s, duration={clip_res.duration:.2f}s."
             )
-            self.messages.append({"role": "assistant", "content": tool_msg})
+            local_messages.append({"role": "assistant", "content": tool_msg})
 
-            # Switch to per-node system context for decision consistency
-            self.messages.append({"role": "system", "content": PER_NODE_SYSTEM_PROMPT})
+            # Switch to per-node system context for decision consistency (local only)
+            local_messages.append({"role": "system", "content": PER_NODE_SYSTEM_PROMPT})
 
-            # Ask the model to decide next action for this node
-            self.messages.append({
+            # Ask the model to decide next action for this node (local only)
+            local_messages.append({
                 "role": "user",
                 "content": build_node_user_prompt(
                     path_id=node.path_id,
@@ -211,7 +234,7 @@ class ToTEngine:
                 )
             })
 
-            node_decision = self._chat_to_json()
+            node_decision = self._chat_to_json(messages=local_messages)
 
             node.status = "processed"
             node.decision = node_decision.get("decision")

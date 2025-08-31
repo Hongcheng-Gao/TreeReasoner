@@ -1,73 +1,66 @@
 # prompts.py
 
-ROOT_SYSTEM_PROMPT = """You are a planning agent for video Q&A under a strict constraint:
-- You cannot access or assume any content from the video clips.
-- The only tool is to select time windows (x–y seconds) to extract clips; the tool returns metadata only (no transcript, no summary, no recognition).
-- Your job is to propose multiple initial exploration paths that specify time windows to inspect, plus the hypothesis each window aims to test.
-- If the question can be answered without seeing content, state that as an early stop condition.
+ROOT_SYSTEM_PROMPT = """
+You are a Tree-of-Thought coordinator for video question answering. You have exactly one tool available: clip a video segment by a time range (from x s to y s). The system will call the tool and return the resulting clipped video path as a message within the dialogue.
 
-Output JSON only:
+Protocol:
+- Input: one video and a question.
+- You cannot analyze the entire video at once. First, propose multiple initial exploration paths (usually time ranges). Each path must include: id, strategy, start_s, end_s.
+- At each step:
+  1) Use only what is visible in the provided context so far (video metadata and tool results the system returns).
+  2) Decide if you can directly answer the question.
+  3) If not, propose 2–3 new exploration paths (time ranges and strategy).
+  4) If there is little value in further exploration, terminate early.
+  5) If a path seems irrelevant, you may discard it.
+
+Output must be JSON with fields:
 {
-  "paths": [
-    {
-      "id": "P1",
-      "rationale": "hypothesis to test via these windows",
-      "time_windows": [
-        {"start_s": number, "end_s": number, "purpose": "the hypothesis/evidence sought (no content assumptions)"}
-      ],
-      "stop_condition": "optional"
-    }
+  "decision": "answer" | "expand" | "terminate" | "discard",
+  "rationale": "brief reason",
+  "proposed_paths": [
+    {"id": "P1" or "P1a", "strategy": "short strategy", "start_s": number, "end_s": number}
   ],
-  "early_stop_if_any": "optional global early-stop when the answer is trivial without watching",
-  "notes": "optional but avoid content speculation"
+  "direct_answer": "final short answer if decision=answer",
+  "confidence": 0.0-1.0
 }
 
-Rules:
-- Propose 2-4 distinct paths, each with 1-3 short windows (5–20s).
-- Cover different hypotheses or different time regions.
-- Do not describe clip contents. Do not guess unseen events.
+Naming:
+- Root paths: P1..Pk; Children: P1a, P1b, etc.
+Time validity:
+- start_s >= 0 and end_s > start_s and within the video duration.
+- If unsure, propose short probing segments (e.g., 0–5s, 5–10s).
+- Keep proposed_paths within the requested limit.
+- You must always reply with strictly valid JSON (no extra text).
 """
 
-ROOT_USER_PROMPT_TEMPLATE = """Video meta:
-{video_meta}
+PER_NODE_SYSTEM_PROMPT = """
+You are continuing a multi-turn dialogue for Tree-of-Thought video QA. The system provides tool results (clipped segment path, time range, duration) as assistant messages. Use only what is present in the dialogue so far and the tool results. Do not assume unseen content.
 
-Question:
-{question}
+Return strictly JSON with fields:
+- decision: "answer" | "expand" | "terminate" | "discard"
+- rationale: brief explanation based on currently visible info
+- proposed_paths: if expand, propose 2–3 child paths (ids must extend parent id, with strategy, start_s, end_s)
+- direct_answer: if answer, provide a concise final answer
+- confidence: 0.0–1.0
 
-Guidance:
-- Keep windows concise and minimally overlapping.
-- Justify each window by what hypothesis it helps test.
-- If trivially answerable without watching, set early_stop_if_any.
+Notes:
+- If the current segment appears irrelevant, you may discard or terminate.
+- Child time ranges must be valid and within the overall video duration.
+- Early termination is allowed.
+- Always output strictly valid JSON only.
 """
 
-NODE_SYSTEM_PROMPT = """You are expanding a single path node under the constraint:
-- You cannot access clip contents; the tool provides only time ranges and metadata.
-- Do not invent any description of what is inside the clips.
-- Decide: answer now (if logically possible without content), propose refined child paths, or discard the path.
+def build_root_user_prompt(video_meta: dict, question: str, max_paths: int = 3) -> str:
+    lines = []
+    lines.append("Input: Video + Question")
+    lines.append(f"Video meta: duration={video_meta.get('duration')}s, fps={video_meta.get('fps')}, size={video_meta.get('width')}x{video_meta.get('height')}")
+    lines.append(f"Question: {question}")
+    lines.append(f"Please propose at most {max_paths} initial exploration paths and reply in JSON.")
+    return "\n".join(lines)
 
-Output JSON only:
-{
-  "can_answer": boolean,
-  "answer": "present only if can_answer=true",
-  "confidence": number,  // 0-1
-  "proposed_children": [
-    {
-      "id": "P1a",
-      "rationale": "what hypothesis to test",
-      "time_windows": [
-        {"start_s": number, "end_s": number, "purpose": "hypothesis/evidence to check"}
-      ],
-      "discard_if": "optional"
-    }
-  ],
-  "discard_this_path": boolean,
-  "notes": "avoid content speculation"
-}
-
-Rules:
-- If further progress requires seeing content, prefer discarding this path or narrowing windows, but do not describe contents.
-- Keep windows short and minimally overlapping.
-- Early terminate if no meaningful progress without content is possible.
-"""
-
-# 无需观测压缩 prompt，因为不再读取内容
+def build_node_user_prompt(path_id: str, strategy: str, start_s: float, end_s: float, clip_path: str, duration: float, max_paths: int = 3) -> str:
+    return (
+        f"Current node: {path_id} (strategy: {strategy}).\n"
+        f"Tool result: clipped segment path={clip_path}, time={start_s:.2f}-{end_s:.2f}s, seg_duration={duration:.2f}s.\n"
+        f"Based on the conversation so far, decide and output JSON (at most {max_paths} child paths if expanding)."
+    )

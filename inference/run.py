@@ -1,28 +1,41 @@
 # run.py
+import argparse
 import json
-from tot_engine import ToTEngine, LLM
-from tool_video import VideoClipper
+import os
+from tot_engine import ToTEngine
 
 def main():
-    video_path = "demo_video.mp4"
-    question = "视频中在10秒到40秒期间，是否有人把红色杯子放在桌子上？"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--video", required=True, help="Input video path")
+    parser.add_argument("--question", required=True, help="Question")
+    parser.add_argument("--workdir", default="./work", help="Working directory")
+    parser.add_argument("--model", default="gpt-4o-mini", help="LLM model name")
+    parser.add_argument("--max_depth", type=int, default=3)
+    parser.add_argument("--per_expand_limit", type=int, default=3)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--api_key", default=os.getenv("OPENAI_API_KEY"))
+    parser.add_argument("--save_tree", default="./tree.json", help="Path to save the reasoning tree JSON")
+    args = parser.parse_args()
 
-    video_meta = json.dumps({
-        "duration_s": 120.0,
-        "fps": 30,
-        "scene_bounds": [[0,10], [10,25], [25,45], [45,120]],
-        "notes": "No transcript/ASR available. Tool only returns clip handles."
-    }, ensure_ascii=False)
+    engine = ToTEngine(
+        llm_model=args.model,
+        api_key=args.api_key,
+        workdir=args.workdir,
+        max_depth=args.max_depth,
+        per_expand_limit=args.per_expand_limit,
+        temperature=args.temperature,
+    )
 
-    llm = LLM()
-    clipper = VideoClipper(video_path)
-    engine = ToTEngine(llm=llm, clipper=clipper, question=question, max_nodes=12, max_depth=3)
-    result = engine.run(video_meta=video_meta, strategy="fifo")
+    result = engine.run(args.video, args.question)
+    tree = engine.export_tree(result)
 
-    print("Answer:", result.get("answer"))
-    print("Confidence:", result.get("confidence"))
-    print("Tree JSON:")
-    print(json.dumps(result.get("tree"), ensure_ascii=False, indent=2))
+    print("Final answer:", result.final_answer)
+    print("Terminated:", result.terminated)
+    print(f"Total nodes: {len(result.nodes)}")
+
+    with open(args.save_tree, "w", encoding="utf-8") as f:
+        json.dump(tree, f, ensure_ascii=False, indent=2)
+    print("Tree saved to:", args.save_tree)
 
 if __name__ == "__main__":
     main()

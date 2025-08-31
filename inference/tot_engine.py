@@ -96,6 +96,9 @@ class ToTEngine:
 
         # Append assistant message to the same thread used for the request
         msgs.append({"role": "assistant", "content": text})
+        raw_text = text
+        match = re.search(r'<\s*TOOL_CALL\s*>(.*?)<\s*/\s*TOOL_CALL\s*>', raw_text, re.DOTALL)
+        text = match.group(1) if match else ''
 
         try:
             data = json.loads(text)

@@ -13,7 +13,7 @@ Protocol:
   4) If there is little value in further exploration, terminate early.
   5) If a path seems irrelevant, you may discard it.
 
-The response must include a reasoning analysis, the selected tool with a brief rationale for its use, and a JSON object enclosed in <TOOL_CALL> and </TOOL_CALL> tags listing the required fields:
+The response must include a reasoning analysis, the decision with a brief reason, and a JSON object enclosed in <TOOL_CALL> and </TOOL_CALL> tags listing the required fields:
 <TOOL_CALL>
 {
   "decision": "answer" | "expand" | "terminate" | "discard",

@@ -176,7 +176,10 @@ class ToTEngine:
         # Initialize dialogue with system and root user prompt
         self.messages = [
             {"role": "system", "content": ROOT_SYSTEM_PROMPT},
-            {"role": "user", "content": build_root_user_prompt(meta, question, max_paths=self.per_expand_limit)},
+            {"role": "user", "content": [
+                {"type": "image", "image": video_path},
+                {"type": "text", "text": build_root_user_prompt(meta, question, max_paths=self.per_expand_limit)}
+            ]},
         ]
 
         # Root planning using the global thread
@@ -229,23 +232,26 @@ class ToTEngine:
                 f"[Tool Result] Clipped segment: path={clip_res.path}, "
                 f"time={node.start_s:.2f}-{node.end_s:.2f}s, duration={clip_res.duration:.2f}s."
             )
-            local_messages.append({"role": "assistant", "content": tool_msg})
+            # local_messages.append({"role": "assistant", "content": tool_msg})
 
             # Per-node system context (local only)
-            local_messages.append({"role": "system", "content": PER_NODE_SYSTEM_PROMPT})
+            # local_messages.append({"role": "system", "content": PER_NODE_SYSTEM_PROMPT})
 
             # Node-specific user prompt (local only)
             local_messages.append({
                 "role": "user",
-                "content": build_node_user_prompt(
-                    path_id=node.path_id,
-                    strategy=node.strategy,
-                    start_s=node.start_s,
-                    end_s=node.end_s,
-                    clip_path=clip_res.path,
-                    duration=clip_res.duration,
-                    max_paths=self.per_expand_limit
-                )
+                "content": [
+                    {"type": "image", "image": clip_res.path},
+                    {"type": "text", "text": tool_msg + build_node_user_prompt(
+                        path_id=node.path_id,
+                        strategy=node.strategy,
+                        start_s=node.start_s,
+                        end_s=node.end_s,
+                        clip_path=clip_res.path,
+                        duration=clip_res.duration,
+                        max_paths=self.per_expand_limit
+                    )}
+                ]
             })
 
             # Get decision for this node using the local thread

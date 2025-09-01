@@ -57,7 +57,10 @@ class ToTEngine:
         self.client = None
         self.llm_model = llm_model
         if OpenAI is not None:
-            self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+            self.client = OpenAI(
+                api_key="Empty",
+                base_url=""
+            )
 
         # Full dialogue history (root planning only uses this)
         self.messages: List[Dict[str, str]] = []
@@ -88,7 +91,7 @@ class ToTEngine:
             return dummy
 
         resp = self.client.chat.completions.create(
-            model=self.llm_model,
+            model="",
             temperature=self.temperature,
             messages=msgs,
         )
@@ -96,6 +99,10 @@ class ToTEngine:
 
         # Append assistant message to the same thread used for the request
         msgs.append({"role": "assistant", "content": text})
+        raw_text = text
+        import re
+        match = re.search(r'<\s*TOOL_CALL\s*>(.*?)<\s*/\s*TOOL_CALL\s*>', raw_text, re.DOTALL)
+        text = match.group(1) if match else ''
 
         try:
             data = json.loads(text)
@@ -295,9 +302,9 @@ class ToTEngine:
                 "decision": n.decision,
                 "direct_answer": n.direct_answer,
                 "rationale": n.rationale,
-                "confidence": n.confidence,
                 "clip_path": n.clip_result.path if n.clip_result else None,
                 "children": n.children,
+                "messages": n.messages,
             }
         return {
             "final_answer": result.final_answer,

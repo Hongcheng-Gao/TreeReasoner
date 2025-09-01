@@ -1,6 +1,7 @@
 # tot_engine.py
 import json
 import os
+import base64
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from moviepy.editor import VideoFileClip
@@ -66,6 +67,24 @@ class ToTEngine:
 
         # Full dialogue history (root planning only uses this)
         self.messages: List[Dict[str, str]] = []
+
+    def _encode_image(self, image_path: str) -> str:
+        """
+        Encode an image file to base64 string.
+        
+        Args:
+            image_path: Path to the image file
+            
+        Returns:
+            Base64 encoded string of the image
+        """
+        try:
+            with open(image_path, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                return encoded_string
+        except Exception as e:
+            print(f"Warning: Failed to encode image {image_path}: {e}")
+            return ""
 
     def _chat_to_json(self, messages: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
         """
@@ -177,7 +196,7 @@ class ToTEngine:
         self.messages = [
             {"role": "system", "content": ROOT_SYSTEM_PROMPT},
             {"role": "user", "content": [
-                {"type": "image", "image": video_path},
+                {"type": "image", "image": self._encode_image(video_path)},
                 {"type": "text", "text": build_root_user_prompt(meta, question, max_paths=self.per_expand_limit)}
             ]},
         ]
@@ -241,7 +260,7 @@ class ToTEngine:
             local_messages.append({
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": clip_res.path},
+                    {"type": "image", "image": self._encode_image(clip_res.path)},
                     {"type": "text", "text": tool_msg + build_node_user_prompt(
                         path_id=node.path_id,
                         strategy=node.strategy,

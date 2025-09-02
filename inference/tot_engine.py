@@ -7,7 +7,7 @@ from typing import List, Optional, Dict, Any
 from moviepy.editor import VideoFileClip
 
 from tool_video import clip_video_segment, VideoClipResult, ensure_dir
-from prompts import ROOT_SYSTEM_PROMPT, PER_NODE_SYSTEM_PROMPT, build_root_user_prompt, build_node_user_prompt
+from prompts import ROOT_SYSTEM_PROMPT, build_root_user_prompt, build_node_user_prompt
 
 try:
     from openai import OpenAI
@@ -62,28 +62,28 @@ class ToTEngine:
         if OpenAI is not None:
             self.client = OpenAI(
                 api_key="Empty",
-                base_url=""
+                base_url=
             )
 
         # Full dialogue history (root planning only uses this)
         self.messages: List[Dict[str, str]] = []
 
-    def _encode_image(self, image_path: str) -> str:
+    def _encode_video(self, video_path: str) -> str:
         """
-        Encode an image file to base64 string.
+        Encode a video file to base64 string.
         
         Args:
-            image_path: Path to the image file
+            video_path: Path to the video file
             
         Returns:
-            Base64 encoded string of the image
+            Base64 encoded string of the video
         """
         try:
-            with open(image_path, "rb") as image_file:
-                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+            with open(video_path, "rb") as video_file:
+                encoded_string = base64.b64encode(video_file.read()).decode('utf-8')
                 return encoded_string
         except Exception as e:
-            print(f"Warning: Failed to encode image {image_path}: {e}")
+            print(f"Warning: Failed to encode video {video_path}: {e}")
             return ""
 
     def _chat_to_json(self, messages: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
@@ -112,7 +112,7 @@ class ToTEngine:
             return dummy
 
         resp = self.client.chat.completions.create(
-            model="",
+            model="kimi-vl-a3b",
             temperature=self.temperature,
             messages=msgs,
         )
@@ -190,13 +190,15 @@ class ToTEngine:
         return nodes
 
     def run(self, video_path: str, question: str) -> ToTRunResult:
+        # import pdb; pdb.set_trace()
+        # print(video_path)
         meta = self._video_meta(video_path)
 
         # Initialize dialogue with system and root user prompt
         self.messages = [
             {"role": "system", "content": ROOT_SYSTEM_PROMPT},
             {"role": "user", "content": [
-                {"type": "image", "image": self._encode_image(video_path)},
+                {"type": "video_url", "video_url": {"url": self._encode_video(video_path)}},
                 {"type": "text", "text": build_root_user_prompt(meta, question, max_paths=self.per_expand_limit)}
             ]},
         ]
@@ -260,7 +262,7 @@ class ToTEngine:
             local_messages.append({
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": self._encode_image(clip_res.path)},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{self._encode_video(clip_res.path)}"}},
                     {"type": "text", "text": tool_msg + build_node_user_prompt(
                         path_id=node.path_id,
                         strategy=node.strategy,

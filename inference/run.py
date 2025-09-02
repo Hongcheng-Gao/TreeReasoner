@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--save_tree", default="./tree.json", help="Path to save the reasoning tree JSON")
     parser.add_argument("--process_clevrer", action="store_true", help="Process CLEVRER entries from input JSON")
     parser.add_argument("--output_results", default="./clevrer_results.json", help="Path to save CLEVRER processing results")
-    parser.add_argument("--data_dir", default="/mnt/moonfs/kimiv-m2/huangzihao/dataset/Video/clevrer_tmp_v5", help="Base data directory for outputs")
+    parser.add_argument("--data_dir", default="/mnt/moonfs/kimiv-m2/huangzihao/dataset/Video/clevrer_tmp_v6", help="Base data directory for outputs")
     args = parser.parse_args()
 
     engine = ToTEngine(

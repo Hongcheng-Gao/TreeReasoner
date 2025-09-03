@@ -2,9 +2,12 @@
 import json
 import os
 import base64
+import io
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from moviepy.editor import VideoFileClip
+import numpy as np
+from PIL import Image
 
 from tool_video import clip_video_segment, VideoClipResult, ensure_dir
 from prompts import ROOT_SYSTEM_PROMPT, build_root_user_prompt, build_node_user_prompt
@@ -46,13 +49,10 @@ class ToTEngine:
         self,
         llm_model: str = "gpt-4o-mini",
         api_key: Optional[str] = None,
-        workdir: str = "./work",
         max_depth: int = 3,
         per_expand_limit: int = 3,
         temperature: float = 0.2,
     ):
-        self.workdir = workdir
-        ensure_dir(self.workdir)
         self.max_depth = max_depth
         self.per_expand_limit = per_expand_limit
         self.temperature = temperature
@@ -61,8 +61,8 @@ class ToTEngine:
         self.llm_model = llm_model
         if OpenAI is not None:
             self.client = OpenAI(
-                api_key="Empty",
-                base_url=
+                api_key=
+                base_url= # Add proper base URL
             )
 
         # Full dialogue history (root planning only uses this)
@@ -85,6 +85,58 @@ class ToTEngine:
         except Exception as e:
             print(f"Warning: Failed to encode video {video_path}: {e}")
             return ""
+
+    def _extract_frames_with_timestamps(self, video_path: str) -> List[Dict[str, Any]]:
+        """
+        Extract frames from video at 1-second intervals and encode them to base64.
+        
+        Args:
+            video_path: Path to the video file
+            
+        Returns:
+            List of dictionaries containing base64 encoded frames and timestamps
+        """
+        frames_data = []
+        import pdb; pdb.set_trace()
+        try:
+            with VideoFileClip(video_path) as clip:
+                duration = int(clip.duration)
+                
+                for second in range(duration + 1):  # Include the last second
+                    if second > duration:
+                        break
+                        
+                    # Extract frame at this second
+                    try:
+                        frame = clip.get_frame(second)
+                        
+                        # Convert numpy array to PIL Image
+                        pil_image = Image.fromarray(frame.astype('uint8'))
+                        
+                        # Convert to base64
+                        buffer = io.BytesIO()
+                        pil_image.save(buffer, format='JPEG')
+                        img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                        
+                        # Format timestamp as HH:MM:SS
+                        hours = second // 3600
+                        minutes = (second % 3600) // 60
+                        seconds = second % 60
+                        timestamp = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                        
+                        frames_data.append({
+                            "base64": f"data:image/jpeg;base64,{img_base64}",
+                            "timestamp": timestamp
+                        })
+                        
+                    except Exception as e:
+                        print(f"Warning: Failed to extract frame at {second}s: {e}")
+                        continue
+                        
+        except Exception as e:
+            print(f"Error processing video {video_path}: {e}")
+            
+        return frames_data
 
     def _chat_to_json(self, messages: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
         """
@@ -112,7 +164,7 @@ class ToTEngine:
             return dummy
 
         resp = self.client.chat.completions.create(
-            model="kimi-vl-a3b",
+            model="google/gemini-2.5-flash",
             temperature=self.temperature,
             messages=msgs,
         )
@@ -192,15 +244,32 @@ class ToTEngine:
     def run(self, video_path: str, question: str) -> ToTRunResult:
         # import pdb; pdb.set_trace()
         # print(video_path)
+        
+        # Set up video-specific working directory
+        video_dir = os.path.dirname(video_path)
+        video_filename = os.path.basename(video_path)
+        video_name = os.path.splitext(video_filename)[0]
+        
+        # Create video-specific workdir
+        self.workdir = os.path.join(video_dir, f"{video_name}_work")
+        ensure_dir(self.workdir)
+        
         meta = self._video_meta(video_path)
 
-        # Initialize dialogue with system and root user prompt
+        # Extract frames with timestamps
+        frames_data = self._extract_frames_with_timestamps(video_path)
+        
+        # Build content list with alternating frames and timestamps
+        frame_content = []
+        for frame_info in frames_data:
+            frame_content.append({"type": "image_url", "image_url": {"url": frame_info["base64"]}})
+            frame_content.append({"type": "text", "text": frame_info["timestamp"]})
+
+        frame_content.append({"type": "text", "text": build_root_user_prompt(meta, question, max_paths=self.per_expand_limit)})
+        # Initialize dialogue with system and frame-based user prompt
         self.messages = [
             {"role": "system", "content": ROOT_SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "video_url", "video_url": {"url": self._encode_video(video_path)}},
-                {"type": "text", "text": build_root_user_prompt(meta, question, max_paths=self.per_expand_limit)}
-            ]},
+            {"role": "user", "content": frame_content},
         ]
 
         # Root planning using the global thread
@@ -235,7 +304,8 @@ class ToTEngine:
                 continue
 
             # Tool call: clip segment
-            clip_res = clip_video_segment(video_path, node.start_s, node.end_s, workdir=self.workdir, tool_type=node.tool_type , current_segment_start_s=node.father_clip_result.start_s)
+            father_start_s = node.father_clip_result.start_s if node.father_clip_result else 0.0            
+            clip_res = clip_video_segment(video_path, node.start_s, node.end_s, workdir=self.workdir, tool_type=node.tool_type, current_segment_start_s=father_start_s)
             node.clip_result = clip_res
 
             # Build local thread for this node:
@@ -258,21 +328,30 @@ class ToTEngine:
             # Per-node system context (local only)
             # local_messages.append({"role": "system", "content": PER_NODE_SYSTEM_PROMPT})
 
+            # Extract frames from the clipped segment
+            segment_frames = self._extract_frames_with_timestamps(clip_res.path)
+            
+            # Build content for the segment
+            segment_content = []
+            for frame_info in segment_frames:
+                segment_content.append({"type": "image_url", "image_url": {"url": frame_info["base64"]}})
+                segment_content.append({"type": "text", "text": frame_info["timestamp"]})
+            
+            # Add tool message and node prompt as text
+            segment_content.append({"type": "text", "text": tool_msg + build_node_user_prompt(
+                path_id=node.path_id,
+                strategy=node.strategy,
+                start_s=node.start_s,
+                end_s=node.end_s,
+                clip_path=clip_res.path,
+                duration=clip_res.duration,
+                max_paths=self.per_expand_limit
+            )})
+
             # Node-specific user prompt (local only)
             local_messages.append({
                 "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{self._encode_video(clip_res.path)}"}},
-                    {"type": "text", "text": tool_msg + build_node_user_prompt(
-                        path_id=node.path_id,
-                        strategy=node.strategy,
-                        start_s=node.start_s,
-                        end_s=node.end_s,
-                        clip_path=clip_res.path,
-                        duration=clip_res.duration,
-                        max_paths=self.per_expand_limit
-                    )}
-                ]
+                "content": segment_content
             })
 
             # Get decision for this node using the local thread

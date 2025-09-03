@@ -9,7 +9,7 @@ def main():
     parser.add_argument("--input_json", required=False, default="/mnt/moonfs/kimiv-m2/huangzihao/dataset/Video-R1-data/Video-R1-COT-165k.json", help="Input JSON file containing CLEVRER data")
     parser.add_argument("--video", required=False, default="/mnt/moonfs/kimiv-public-m2/huangzihao/data/video/movie_mp4/longvila_videos_O/OJ4QDtCxKbQ.mp4", help="Input video path (used when not processing JSON)")
     parser.add_argument("--question", required=False, default="What is the primary intention behind the video, based on the evolving scenes and contextual clues?  \nD. To contrast street food preparation with high-end restaurant dining in Vietnam.  \nA. To promote a specific Vietnamese restaurant chain's menu and pricing.  \nB. To showcase a curated culinary guide to Vietnamese food experiences, likely tied to a travel or food content creator.  \nC. To document a personal travel experience focused on beach relaxation with incidental food scenes.  \n", help="Question (used when not processing JSON)")
-    parser.add_argument("--workdir", default="./work", help="Working directory")
+    parser.add_argument("--workdir", default="./work", help="Base working directory (will be overridden for video-specific dirs)")
     parser.add_argument("--model", default="gpt-4o-mini", help="LLM model name")
     parser.add_argument("--max_depth", type=int, default=3)
     parser.add_argument("--per_expand_limit", type=int, default=3)
@@ -18,13 +18,12 @@ def main():
     parser.add_argument("--save_tree", default="./tree.json", help="Path to save the reasoning tree JSON")
     parser.add_argument("--process_clevrer", action="store_true", help="Process CLEVRER entries from input JSON")
     parser.add_argument("--output_results", default="./clevrer_results.json", help="Path to save CLEVRER processing results")
-    parser.add_argument("--data_dir", default="/mnt/moonfs/kimiv-m2/huangzihao/dataset/Video/clevrer_tmp_v6", help="Base data directory for outputs")
+    parser.add_argument("--data_dir", default="/mnt/moonfs/kimiv-m2/huangzihao/dataset/Video/clevrer_tmp_v8", help="Base data directory for outputs")
     args = parser.parse_args()
 
     engine = ToTEngine(
         llm_model=args.model,
         api_key=args.api_key,
-        workdir=args.workdir,
         max_depth=args.max_depth,
         per_expand_limit=args.per_expand_limit,
         temperature=args.temperature,

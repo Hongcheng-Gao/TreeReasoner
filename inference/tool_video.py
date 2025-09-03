@@ -31,7 +31,7 @@ def clip_video_segment(
     audio_codec: Optional[str] = "aac",
     crf: int = 23,
     tool_type: str = "raw",
-    current_segment_start_s: float = 0.0,
+    slide: float = 0.0,
 ) -> VideoClipResult:
     """
     The single tool: clip a video segment [start_s, end_s] from input_video_path
@@ -46,7 +46,7 @@ def clip_video_segment(
         audio_codec: Audio codec
         crf: Constant Rate Factor for quality
         tool_type: Clipping strategy - "raw", "segment", or "relative"
-        current_segment_start_s: Start time of current segment in original video
+        slide: Start time of current segment in original video
     """
     if start_s < 0:
         start_s = 0.0
@@ -57,16 +57,16 @@ def clip_video_segment(
     uid = str(uuid.uuid4())[:8]
     
     # Determine the actual time range based on tool_type
-    if tool_type == "raw":
+    if tool_type in ["global", "local"]:
         # Use input video path directly with original time range
         actual_start_s = start_s
         actual_end_s = end_s
         result_start_s = start_s
         result_end_s = end_s
-    elif tool_type in ["segment", "relative"]:
+    elif tool_type in ["slide"]:
         # Calculate absolute time points in the original video
-        actual_start_s = current_segment_start_s + start_s
-        actual_end_s = current_segment_start_s + end_s
+        actual_start_s = slide + start_s
+        actual_end_s = slide + end_s
         result_start_s = actual_start_s
         result_end_s = actual_end_s
     else:

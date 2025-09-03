@@ -25,7 +25,8 @@ class PathNode:
     strategy: str
     depth: int
     parent_id: Optional[str] = None
-    tool_type: str = "raw"  # raw | segment | relative
+    tool_type: str = "global"  # global| local | slide
+    stride: float = 0.0  # Only for "slide" type
     father_clip_result: Optional[VideoClipResult] = None  # 新增：父节点的裁剪结果
     clip_result: Optional[VideoClipResult] = None
     status: str = "pending"  # pending | processed | discarded
@@ -221,9 +222,10 @@ class ToTEngine:
         for i, p in enumerate(proposed):
             pid = str(p.get("id") or f"P{depth}_{i+1}")
             strat = str(p.get("strategy") or "explore")
-            start_s = float(p.get("start_s", 0))
+            start_s = float(p.get("start_s", 0.0))
             end_s = float(p.get("end_s", max(0.1, min(duration, start_s + 5))))
-            tool_type = str(p.get("tool_type", "raw")).lower()
+            tool_type = str(p.get("tool_type", "global")).lower()
+            stride = float(p.get("stride", 0.0))
             if start_s < 0:
                 start_s = 0.0
             if end_s <= start_s:
@@ -237,6 +239,7 @@ class ToTEngine:
                 depth=depth,
                 parent_id=parent_id,
                 tool_type=tool_type,
+                stride=stride,
             )
             nodes.append(node)
         return nodes
@@ -304,8 +307,8 @@ class ToTEngine:
                 continue
 
             # Tool call: clip segment
-            father_start_s = node.father_clip_result.start_s if node.father_clip_result else 0.0            
-            clip_res = clip_video_segment(video_path, node.start_s, node.end_s, workdir=self.workdir, tool_type=node.tool_type, current_segment_start_s=father_start_s)
+            # father_clip_result = node.father_clip_result if node.father_clip_result else 0.0            
+            clip_res = clip_video_segment(video_path, node.father_clip_result.start_s, node.father_clip_result.end_s, workdir=self.workdir, tool_type=node.tool_type, stride=node.stride)
             node.clip_result = clip_res
 
             # Build local thread for this node:
@@ -414,6 +417,9 @@ class ToTEngine:
                 "direct_answer": n.direct_answer,
                 "rationale": n.rationale,
                 "father_clip_path": n.father_clip_result.path if n.father_clip_result else None,  # 新增导出字段
+                "father_clip_result": n.father_clip_result,
+                "tool_type": n.tool_type,
+                "stride": n.stride,
                 "clip_path": n.clip_result.path if n.clip_result else None,
                 "children": n.children,
                 "messages": n.messages,

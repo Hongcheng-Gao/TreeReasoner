@@ -308,7 +308,11 @@ class ToTEngine:
 
             # Tool call: clip segment
             # father_clip_result = node.father_clip_result if node.father_clip_result else 0.0            
-            clip_res = clip_video_segment(video_path, node.father_clip_result.start_s, node.father_clip_result.end_s, workdir=self.workdir, tool_type=node.tool_type, stride=node.stride)
+            if node.tool_type in ["global", "local"]:
+                clip_res = clip_video_segment(video_path, node.start_s, node.end_s, workdir=self.workdir, tool_type=node.tool_type)
+            elif node.tool_type in ["slide"]:  
+                clip_res = clip_video_segment(video_path, node.father_clip_result.start_s, node.father_clip_result.end_s, workdir=self.workdir, tool_type=node.tool_type, stride=node.stride)
+            node.clip_result = clip_res
             node.clip_result = clip_res
 
             # Build local thread for this node:

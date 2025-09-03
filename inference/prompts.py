@@ -27,8 +27,8 @@ The response must first include a reasoning analysis, then the decision with a b
 
 Tool Types:
 - "global": Perform video segmentation on the original video. Requires start_s and end_s parameters (time points on the original video). Does not use stride parameter.
-- "local": Perform video segmentation on the currently processed video. Requires start_s and end_s parameters (time points on the original video, but must not exceed the range of the currently processed video). Does not use stride parameter.
-- "slide": Slide the current video window. Requires stride parameter (positive values slide right, negative values slide left). Does not use start_s and end_s parameters.
+- "local": Perform video segmentation on the currently processed video. Requires start_s and end_s parameters (time points on the original video, but must not exceed the range of the currently processed video). Does not use stride parameter and set the value to 0.
+- "slide": Slide the current video window. Requires stride parameter (positive values slide right, negative values slide left). Do not use the start_s and end_s parameters, and set both values to 0.
 
 Naming:
 - Root paths: Pa..Pz; Children: Paa, Pab, etc.

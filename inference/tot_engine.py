@@ -64,9 +64,7 @@ class ToTEngine:
         self.llm_model = llm_model
         if OpenAI is not None:
             self.client = OpenAI(
-                # api_key="sk-VWyPFNDXKVnTiItv66qXrJZIhfEb5kdxqPJoQ5ACHwDl0ulH",
-                api_key="Empty",
-                base_url="https://Qwen2-5-VL-72B-Instruct-128k-for-cc.app.msh.team/v1" # Add proper base URL
+                # api_key="Empty",
             )
 
         # Full dialogue history (root planning only uses this)
@@ -244,7 +242,7 @@ class ToTEngine:
             return dummy
 
         resp = self.client.chat.completions.create(
-            model="Qwen2-5-VL-72B-Instruct-128k-for-cc",
+            model="google/gemini-2.5-flash",
             temperature=self.temperature,
             messages=msgs,
         )

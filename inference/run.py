@@ -106,8 +106,8 @@ def process_dataset_entries(data, dataset_filter_func, dataset_name, target_coun
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_json", required=False, default="/mnt/moonfs/kimiv-m2/huangzihao/dataset/Video-R1-data/Video-R1-COT-165k.json", help="Input JSON file containing video data")
-    parser.add_argument("--video", required=False, default="/mnt/moonfs/kimiv-public-m2/zihao/test/1.mov", help="Input video path (used when not processing JSON)")
-    parser.add_argument("--question", required=False, default="带你到天空去这个歌词出现在第几秒")
+    parser.add_argument("--video", required=False, default="/mnt/moonfs/kimiv-m2/huangzihao/dataset/Video-R1-data/NeXT-QA/NextQA/NExTVideo/1124/4888273655.mp4", help="Input video path (used when not processing JSON)")
+    parser.add_argument("--question", required=False, default="Why did the lady stroke the dog on its back at the start?\nOptions:A. curious. B. playing with baby. C. untangle the leash. D. caressing for him. E. playing")
     parser.add_argument("--workdir", default="./work", help="Base working directory (will be overridden for video-specific dirs)")
     parser.add_argument("--model", default="gpt-4o-mini", help="LLM model name")
     parser.add_argument("--max_depth", type=int, default=3)

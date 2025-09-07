@@ -9,19 +9,19 @@ Protocol:
 - At each step:
   1) Use only what is visible in the provided context so far (video metadata and tool results the system returns).
   2) Decide if you can directly answer the question.
-  3) If not, propose 2–3 new exploration paths (time ranges and strategy).
-  4) If there is little value in further exploration, terminate early.
-  5) If a path seems irrelevant, you may discard it.
+  3) If not, propose 1-3 new exploration paths (time ranges and strategy).
+  4) If a path seems irrelevant, you may discard it.
 
 The response must first include a reasoning analysis, then the decision with a brief reason, and finally a JSON object enclosed in <TOOL_CALL> and </TOOL_CALL> tags listing the required fields:
 <TOOL_CALL>
 {
-  "decision": "answer" | "expand" | "terminate" | "discard",
+  "decision": "answer" | "expand" | "discard",
   "rationale": "brief reason",
   "proposed_paths": [
     {"id": "Pa" or "Paa", "strategy": "short strategy", "start_s": number, "end_s": number, "tool_type": "global"|"local"|"slide", "stride": number}
   ],
   "direct_answer": "final short answer if decision=answer, in the format of \\boxed{} (e.g. \\boxed{A})."
+  "confidence": "confidence score for the answer, between 0 and 10"
 }
 </TOOL_CALL>
 
@@ -84,7 +84,7 @@ def build_root_user_prompt(video_meta: dict, question: str, max_paths: int = 3) 
     lines.append("Input: Video + Question")
     lines.append(f"Video meta: duration={video_meta.get('duration')}s, size={video_meta.get('width')}x{video_meta.get('height')}")
     lines.append(f"Question: {question}")
-    lines.append(f"Propose at most {max_paths} but a least two initial exploration paths.")
+    lines.append(f"Propose {max_paths} initial exploration paths.")
     lines.append(
         "First, provide your reasoning analysis. After your analysis, output only a JSON object containing the required fields, strictly wrapped between <TOOL_CALL> and </TOOL_CALL> tags."
     )
@@ -96,6 +96,6 @@ def build_node_user_prompt(path_id: str, strategy: str, start_s: float, end_s: f
         f"Current node: {path_id} (strategy: {strategy}).\n"
         f"Tool result: clipped segment path={clip_path}, time={start_s:.2f}-{end_s:.2f}s, seg_duration={duration:.2f}s.\n"
         f"First, provide your reasoning analysis based on the conversation so far and the current segment analysis.\n"
-        f"After your analysis, output only a JSON object containing the required fields, strictly wrapped between <TOOL_CALL> and </TOOL_CALL> tags (with at most {max_paths} child paths if expanding)."
+        f"After your analysis, you can continue to expand paths if the information is insufficient to reach a final answer, or provide the answer directly. Output only a JSON object containing the required fields, strictly wrapped between <TOOL_CALL> and </TOOL_CALL> tags (with at most {max_paths} child paths if expanding)."
         "**Note that the direct_answer should be in the format of '\\boxed{}' (e.g. '\\boxed{A}') if exists.**"
     )

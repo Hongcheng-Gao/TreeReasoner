@@ -46,6 +46,7 @@ class ToTRunResult:
     terminated: bool = False
     # 新增：收集所有找到的答案
     all_answers: List[Dict[str, Any]] = field(default_factory=list)
+    confidence: Optional[float] = None
 
 class ToTEngine:
     def __init__(
@@ -64,7 +65,9 @@ class ToTEngine:
         self.llm_model = llm_model
         if OpenAI is not None:
             self.client = OpenAI(
+                api_key="sk-VWyPFNDXKVnTiItv66qXrJZIhfEb5kdxqPJoQ5ACHwDl0ulH",
                 # api_key="Empty",
+                base_url="https://openai.app.msh.team/v1" # Add proper base URL
             )
 
         # Full dialogue history (root planning only uses this)
@@ -235,7 +238,7 @@ class ToTEngine:
                     {"id": "P2", "strategy": "probe middle", "start_s": 5, "end_s": 10},
                 ],
                 "direct_answer": None,
-                "confidence": 0.3,
+                "confidence": 0.3, 
             }
             # Keep dialogue shape
             msgs.append({"role": "assistant", "content": json.dumps(dummy, ensure_ascii=False)})
@@ -464,6 +467,7 @@ class ToTEngine:
             })
 
             # Get decision for this node using the local thread
+            # import pdb; pdb.set_trace()
             node_decision = self._chat_to_json(messages=local_messages)
 
             # Persist the local thread on the node for its children to inherit
@@ -497,14 +501,20 @@ class ToTEngine:
                 # 如果这是第一个答案，设置为final_answer
                 if final_answer is None:
                     final_answer = node_decision.get("direct_answer")
+                    confidence = node_decision.get("confidence", 0.0)
+
+                
                 
                 print(f"Found answer from path {node.path_id}: {node_decision.get('direct_answer')}")
                 # 不break，继续处理其他路径
                 continue
 
-            if node.decision == "terminate":
-                # 只有在明确要求终止时才终止，但仍然继续处理queue中的其他路径
-                print(f"Path {node.path_id} chose to terminate")
+            # if node.decision == "terminate":
+            #     # 只有在明确要求终止时才终止，但仍然继续处理queue中的其他路径
+            #     print(f"Path {node.path_id} chose to terminate")
+            #     continue
+
+            if node.confidence < 3:
                 continue
 
             if node.decision == "expand":
@@ -530,7 +540,7 @@ class ToTEngine:
         else:
             print("Exploration completed. No answers found.")
 
-        return ToTRunResult(root_paths=root_paths, nodes=nodes, final_answer=final_answer, terminated=terminated, all_answers=all_answers)
+        return ToTRunResult(root_paths=root_paths, nodes=nodes, final_answer=final_answer, terminated=terminated, all_answers=all_answers, confidence=confidence)
 
     @staticmethod
     def export_tree(result: ToTRunResult) -> Dict[str, Any]:
@@ -553,9 +563,12 @@ class ToTEngine:
                 "clip_path": n.clip_result.path if n.clip_result else None,
                 "children": n.children,
                 "messages": n.messages,
+                "confidence": n.confidence,
             }
+        # import pdb; pdb.set_trace()
         return {
             "final_answer": result.final_answer,
+            "confidence": result.confidence,
             "terminated": result.terminated,
             "root_paths": result.root_paths,
             "nodes": out_nodes,

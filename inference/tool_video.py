@@ -6,10 +6,11 @@ from moviepy.editor import VideoFileClip
 
 @dataclass
 class VideoClipResult:
-    path: str
+    path: str  # Now represents the original video path instead of a clip path
     start_s: float
     end_s: float
     duration: float
+    is_time_interval: bool = True  # Flag to indicate this is a time interval, not a file
 
     def to_dict(self):
         return {
@@ -17,6 +18,7 @@ class VideoClipResult:
             "start_s": self.start_s,
             "end_s": self.end_s,
             "duration": self.duration,
+            "is_time_interval": self.is_time_interval,
         }
 
 def ensure_dir(path: str):
@@ -34,17 +36,17 @@ def clip_video_segment(
     slide: float = 0.0,
 ) -> VideoClipResult:
     """
-    The single tool: clip a video segment [start_s, end_s] from input_video_path
-    and return the path to the clipped video file.
+    The single tool: return a time interval [start_s, end_s] from input_video_path
+    instead of creating an actual video clip.
     
     Args:
         input_video_path: Path to the video file (original video for all modes)
         start_s: Start time in seconds
         end_s: End time in seconds
-        workdir: Working directory for output files
-        codec: Video codec
-        audio_codec: Audio codec
-        crf: Constant Rate Factor for quality
+        workdir: Working directory for output files (unused but kept for compatibility)
+        codec: Video codec (unused but kept for compatibility)
+        audio_codec: Audio codec (unused but kept for compatibility)
+        crf: Constant Rate Factor for quality (unused but kept for compatibility)
         tool_type: Clipping strategy - "raw", "segment", or "relative"
         slide: Start time of current segment in original video
     """
@@ -53,9 +55,6 @@ def clip_video_segment(
     if end_s <= start_s:
         raise ValueError("end_s must be greater than start_s")
 
-    ensure_dir(workdir)
-    uid = str(uuid.uuid4())[:8]
-    
     # Determine the actual time range based on tool_type
     if tool_type in ["global", "local"]:
         # Use input video path directly with original time range
@@ -72,32 +71,30 @@ def clip_video_segment(
     else:
         raise ValueError(f"Unsupported tool_type: {tool_type}")
 
-    out_path = os.path.join(workdir, f"segment_{uid}_{int(actual_start_s)}_{int(actual_end_s)}.mp4")
-
-    with VideoFileClip(input_video_path) as clip:
-        duration = clip.duration
-        
-        # Ensure end time doesn't exceed video duration
-        if actual_end_s > duration:
-            actual_end_s = duration
-            result_end_s = actual_end_s
-        
-        # Ensure start time is valid
-        if actual_start_s >= duration:
-            raise ValueError(f"Start time {actual_start_s}s exceeds video duration {duration}s")
+    # Get video duration for validation
+    try:
+        with VideoFileClip(input_video_path) as clip:
+            duration = clip.duration
             
-        subclip = clip.subclip(actual_start_s, actual_end_s)
-        subclip.write_videofile(
-            out_path,
-            codec=codec,
-            audio_codec=audio_codec,
-            temp_audiofile=os.path.join(workdir, f"temp-audio-{uid}.m4a"),
-            remove_temp=True,
-            verbose=False,
-            logger=None,
-            threads=2,
-            ffmpeg_params=["-crf", str(crf)],
-        )
-        seg_duration = subclip.duration
+            # Ensure end time doesn't exceed video duration
+            if actual_end_s > duration:
+                actual_end_s = duration
+                result_end_s = actual_end_s
+            
+            # Ensure start time is valid
+            if actual_start_s >= duration:
+                raise ValueError(f"Start time {actual_start_s}s exceeds video duration {duration}s")
+    except Exception as e:
+        print(f"Warning: Could not validate video duration: {e}")
+        # Continue with provided times if validation fails
 
-    return VideoClipResult(out_path, result_start_s, result_end_s, seg_duration)
+    seg_duration = result_end_s - result_start_s
+
+    # Return time interval instead of actual clip
+    return VideoClipResult(
+        path=input_video_path,  # Original video path
+        start_s=result_start_s, 
+        end_s=result_end_s, 
+        duration=seg_duration,
+        is_time_interval=True
+    )

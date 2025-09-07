@@ -44,6 +44,8 @@ class ToTRunResult:
     nodes: Dict[str, PathNode]
     final_answer: Optional[str] = None
     terminated: bool = False
+    # 新增：收集所有找到的答案
+    all_answers: List[Dict[str, Any]] = field(default_factory=list)
 
 class ToTEngine:
     def __init__(
@@ -62,12 +64,16 @@ class ToTEngine:
         self.llm_model = llm_model
         if OpenAI is not None:
             self.client = OpenAI(
-                api_key=
-                base_url= # Add proper base URL
+                # api_key="sk-VWyPFNDXKVnTiItv66qXrJZIhfEb5kdxqPJoQ5ACHwDl0ulH",
+                api_key="Empty",
+                base_url="https://Qwen2-5-VL-72B-Instruct-128k-for-cc.app.msh.team/v1" # Add proper base URL
             )
 
         # Full dialogue history (root planning only uses this)
         self.messages: List[Dict[str, str]] = []
+        
+        # Store extracted frames for reuse
+        self.frame_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def _encode_video(self, video_path: str) -> str:
         """
@@ -87,29 +93,40 @@ class ToTEngine:
             print(f"Warning: Failed to encode video {video_path}: {e}")
             return ""
 
-    def _extract_frames_with_timestamps(self, video_path: str) -> List[Dict[str, Any]]:
+    def _extract_initial_frames(self, video_path: str, fps: float = 10.0) -> List[Dict[str, Any]]:
         """
-        Extract frames from video at 1-second intervals and encode them to base64.
+        Extract frames from video at specified fps and store them with timestamps.
         
         Args:
             video_path: Path to the video file
+            fps: Frames per second to extract (default: 10.0)
             
         Returns:
             List of dictionaries containing base64 encoded frames and timestamps
         """
+        
+        if video_path in self.frame_cache:
+            return self.frame_cache[video_path]
+            
         frames_data = []
-        import pdb; pdb.set_trace()
+        # 查看原始视频帧数
+        with VideoFileClip(video_path) as clip:
+            duration = clip.duration
+            print(f"Original video duration: {duration}s")
+            print(f"Original video fps: {clip.fps}")
+            print(f"Original video width: {clip.w}")
+            print(f"Original video height: {clip.h}")
+        # import pdb; pdb.set_trace()
         try:
             with VideoFileClip(video_path) as clip:
-                duration = int(clip.duration)
+                duration = clip.duration
+                interval = 1.0 / fps  # Time interval between frames
                 
-                for second in range(duration + 1):  # Include the last second
-                    if second > duration:
-                        break
-                        
-                    # Extract frame at this second
+                timestamp = 0.0
+                while timestamp <= duration:
                     try:
-                        frame = clip.get_frame(second)
+                        # Extract frame at this timestamp
+                        frame = clip.get_frame(timestamp)
                         
                         # Convert numpy array to PIL Image
                         pil_image = Image.fromarray(frame.astype('uint8'))
@@ -119,25 +136,87 @@ class ToTEngine:
                         pil_image.save(buffer, format='JPEG')
                         img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
                         
-                        # Format timestamp as HH:MM:SS
-                        hours = second // 3600
-                        minutes = (second % 3600) // 60
-                        seconds = second % 60
-                        timestamp = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-                        
                         frames_data.append({
                             "base64": f"data:image/jpeg;base64,{img_base64}",
                             "timestamp": timestamp
                         })
                         
+                        timestamp += interval
+                        
                     except Exception as e:
-                        print(f"Warning: Failed to extract frame at {second}s: {e}")
+                        print(f"Warning: Failed to extract frame at {timestamp}s: {e}")
+                        timestamp += interval
                         continue
                         
         except Exception as e:
             print(f"Error processing video {video_path}: {e}")
             
+        # Cache the extracted frames
+        self.frame_cache[video_path] = frames_data
         return frames_data
+
+    def _find_nearest_frame(self, target_timestamp: float, available_frames: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Find the frame with timestamp closest to the target timestamp.
+        
+        Args:
+            target_timestamp: The desired timestamp
+            available_frames: List of available frames with timestamps
+            
+        Returns:
+            Frame dictionary with closest timestamp
+        """
+        if not available_frames:
+            return None
+            
+        closest_frame = min(available_frames, key=lambda f: abs(f["timestamp"] - target_timestamp))
+        return closest_frame
+
+    def _extract_frames_with_timestamps(self, video_path: str, start_s: float = None, end_s: float = None) -> List[Dict[str, Any]]:
+        """
+        Extract 16 frames evenly spaced within the specified time interval,
+        using the nearest available frames from the initial extraction.
+        
+        Args:
+            video_path: Path to the video file (or time interval for tools)
+            start_s: Start time in seconds (None for full video)
+            end_s: End time in seconds (None for full video)
+            
+        Returns:
+            List of dictionaries containing base64 encoded frames and timestamps
+        """
+        # Get all available frames
+        available_frames = self.frame_cache.get(video_path, [])
+        if not available_frames:
+            # Fallback: extract frames if not cached
+            available_frames = self._extract_initial_frames(video_path)
+        
+        # If no time interval specified, return all frames for initial processing
+        if start_s is None or end_s is None:
+            return available_frames
+        
+        # For tool processing: select 16 frames within the specified interval
+        target_frames = []
+        num_frames = 16
+        
+        if end_s <= start_s:
+            end_s = start_s + 0.1  # Minimum interval
+        
+        interval_duration = end_s - start_s
+        frame_interval = interval_duration / (num_frames - 1) if num_frames > 1 else 0
+        
+        for i in range(num_frames):
+            target_timestamp = start_s + (i * frame_interval)
+            nearest_frame = self._find_nearest_frame(target_timestamp, available_frames)
+            
+            if nearest_frame:
+                # Create a copy with the target timestamp for context
+                frame_copy = nearest_frame.copy()
+                frame_copy["original_timestamp"] = nearest_frame["timestamp"]
+                frame_copy["target_timestamp"] = target_timestamp
+                target_frames.append(frame_copy)
+        
+        return target_frames
 
     def _chat_to_json(self, messages: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
         """
@@ -165,7 +244,7 @@ class ToTEngine:
             return dummy
 
         resp = self.client.chat.completions.create(
-            model="google/gemini-2.5-flash",
+            model="Qwen2-5-VL-72B-Instruct-128k-for-cc",
             temperature=self.temperature,
             messages=msgs,
         )
@@ -202,7 +281,6 @@ class ToTEngine:
 
         data.setdefault("proposed_paths", [])
         data.setdefault("direct_answer", None)
-        data.setdefault("confidence", 0.0)
         data.setdefault("rationale", "")
         data.setdefault("decision", "terminate")
         return data
@@ -259,14 +337,22 @@ class ToTEngine:
         
         meta = self._video_meta(video_path)
 
-        # Extract frames with timestamps
-        frames_data = self._extract_frames_with_timestamps(video_path)
+        # Extract initial frames at fps=4 with timestamp information
+        frames_data = self._extract_initial_frames(video_path, fps=10.0)
         
         # Build content list with alternating frames and timestamps
         frame_content = []
-        for frame_info in frames_data:
+
+        init_segment_frames = self._extract_frames_with_timestamps(
+                video_path, 
+                start_s=0, 
+                end_s=meta["duration"]
+        )
+        print(len(init_segment_frames))
+
+        for frame_info in init_segment_frames:
             frame_content.append({"type": "image_url", "image_url": {"url": frame_info["base64"]}})
-            frame_content.append({"type": "text", "text": frame_info["timestamp"]})
+            frame_content.append({"type": "text", "text": f"timestamp: {frame_info['timestamp']}s"})
 
         frame_content.append({"type": "text", "text": build_root_user_prompt(meta, question, max_paths=self.per_expand_limit)})
         # Initialize dialogue with system and frame-based user prompt
@@ -281,9 +367,14 @@ class ToTEngine:
         root_paths: List[str] = []
 
         if root_decision.get("decision") == "answer":
-            return ToTRunResult(root_paths=[], nodes=nodes, final_answer=root_decision.get("direct_answer"), terminated=True)
+            all_answers = [{
+                "path_id": "root",
+                "answer": root_decision.get("direct_answer"),
+                "rationale": root_decision.get("rationale", "")
+            }]
+            return ToTRunResult(root_paths=[], nodes=nodes, final_answer=root_decision.get("direct_answer"), terminated=True, all_answers=all_answers)
         if root_decision.get("decision") == "terminate":
-            return ToTRunResult(root_paths=[], nodes=nodes, final_answer=None, terminated=True)
+            return ToTRunResult(root_paths=[], nodes=nodes, final_answer=None, terminated=True, all_answers=[])
 
         proposed = root_decision.get("proposed_paths", [])[: self.per_expand_limit]
         initial_nodes = self._sanitize_paths(proposed, parent_id=None, duration=meta["duration"], depth=1)
@@ -291,6 +382,8 @@ class ToTEngine:
             nodes[n.path_id] = n
             root_paths.append(n.path_id)
 
+        # 收集所有找到的答案
+        all_answers = []
         final_answer = None
         terminated = False
 
@@ -300,7 +393,7 @@ class ToTEngine:
         # Sequential expansion (dialogue-driven) with per-path inherited context
         queue = list(root_paths)
 
-        while queue and not terminated:
+        while queue:
             pid = queue.pop(0)
             node = nodes[pid]
             if node.depth > self.max_depth:
@@ -326,26 +419,37 @@ class ToTEngine:
                 local_messages = list(parent.messages) if parent.messages is not None else list(root_history)
 
             # Append this node's tool result (local only)
-            tool_msg = (
-                f"[Tool Result] Clipped segment: path={clip_res.path}, "
-                f"time={node.start_s:.2f}-{node.end_s:.2f}s, duration={clip_res.duration:.2f}s."
-            )
+            # tool_msg = (
+            #     f"[Tool Result] Time interval analysis: [{clip_res.start_s:.2f}s - {clip_res.end_s:.2f}s] "
+            #     f"(duration: {clip_res.duration:.2f}s). Extracted 16 frames evenly spaced within this interval."
+            # )
             # local_messages.append({"role": "assistant", "content": tool_msg})
 
             # Per-node system context (local only)
             # local_messages.append({"role": "system", "content": PER_NODE_SYSTEM_PROMPT})
 
-            # Extract frames from the clipped segment
-            segment_frames = self._extract_frames_with_timestamps(clip_res.path)
+            # Extract frames from the time interval (16 frames evenly spaced)
+            segment_frames = self._extract_frames_with_timestamps(
+                video_path, 
+                start_s=clip_res.start_s, 
+                end_s=clip_res.end_s
+            )
+
+            print(len(segment_frames))
             
             # Build content for the segment
             segment_content = []
             for frame_info in segment_frames:
                 segment_content.append({"type": "image_url", "image_url": {"url": frame_info["base64"]}})
-                segment_content.append({"type": "text", "text": frame_info["timestamp"]})
+                # Show both target and original timestamps for context
+                if 'original_timestamp' in frame_info:
+                    timestamp_text = f"timestamp: {frame_info['original_timestamp']:.2f}s"
+                else:
+                    timestamp_text = f"timestamp: {frame_info.get('target_timestamp', frame_info['timestamp']):.2f}s"
+                segment_content.append({"type": "text", "text": timestamp_text})
             
             # Add tool message and node prompt as text
-            segment_content.append({"type": "text", "text": tool_msg + build_node_user_prompt(
+            segment_content.append({"type": "text", "text": build_node_user_prompt(
                 path_id=node.path_id,
                 strategy=node.strategy,
                 start_s=node.start_s,
@@ -379,19 +483,36 @@ class ToTEngine:
                 continue
 
             if node.decision == "answer":
-                final_answer = node_decision.get("direct_answer")
-                node.direct_answer = final_answer
-                terminated = True
-                break
+                # 收集答案但不终止，继续探索其他路径
+                answer_info = {
+                    "path_id": node.path_id,
+                    "answer": node_decision.get("direct_answer"),
+                    "rationale": node_decision.get("rationale", ""),
+                    "start_s": node.start_s,
+                    "end_s": node.end_s,
+                    "strategy": node.strategy,
+                    "depth": node.depth
+                }
+                all_answers.append(answer_info)
+                node.direct_answer = node_decision.get("direct_answer")
+                
+                # 如果这是第一个答案，设置为final_answer
+                if final_answer is None:
+                    final_answer = node_decision.get("direct_answer")
+                
+                print(f"Found answer from path {node.path_id}: {node_decision.get('direct_answer')}")
+                # 不break，继续处理其他路径
+                continue
 
             if node.decision == "terminate":
-                terminated = True
-                break
+                # 只有在明确要求终止时才终止，但仍然继续处理queue中的其他路径
+                print(f"Path {node.path_id} chose to terminate")
+                continue
 
             if node.decision == "expand":
                 if node.depth >= self.max_depth:
-                    terminated = True
-                    break
+                    print(f"Path {node.path_id} reached max depth {self.max_depth}")
+                    continue
                 child_nodes = self._sanitize_paths(
                     node_decision.get("proposed_paths", [])[: self.per_expand_limit],
                     parent_id=node.path_id,
@@ -404,7 +525,14 @@ class ToTEngine:
                     node.children.append(child.path_id)
                     queue.append(child.path_id)
 
-        return ToTRunResult(root_paths=root_paths, nodes=nodes, final_answer=final_answer, terminated=terminated)
+        # 如果收集到了答案，设置terminated为True
+        if all_answers:
+            terminated = True
+            print(f"Exploration completed. Found {len(all_answers)} answers in total.")
+        else:
+            print("Exploration completed. No answers found.")
+
+        return ToTRunResult(root_paths=root_paths, nodes=nodes, final_answer=final_answer, terminated=terminated, all_answers=all_answers)
 
     @staticmethod
     def export_tree(result: ToTRunResult) -> Dict[str, Any]:
@@ -433,4 +561,5 @@ class ToTEngine:
             "terminated": result.terminated,
             "root_paths": result.root_paths,
             "nodes": out_nodes,
+            "all_answers": result.all_answers,  # 新增：导出所有找到的答案
         }

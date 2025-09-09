@@ -172,7 +172,7 @@ def main():
                     options = " ".join(entry["options"])
                 else:
                     options = ""
-                question = question + options
+                question = question + " " + options
 
                 solution = entry["solution"]
                 

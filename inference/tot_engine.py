@@ -27,7 +27,9 @@ class PathNode:
     parent_id: Optional[str] = None
     tool_type: str = "global"  # global| local | slide
     stride: float = 0.0  # Only for "slide" type
-    father_clip_result: Optional[VideoClipResult] = None  # 新增：父节点的裁剪结果
+    # father_clip_result: Optional[VideoClipResult] = None  # 新增：父节点的裁剪结果
+    father_start_s: float = 0.0  # 新增：父节点的裁剪结果
+    father_end_s: float = 0.0  # 新增：父节点的裁剪结果
     clip_result: Optional[VideoClipResult] = None
     status: str = "pending"  # pending | processed | discarded
     decision: Optional[str] = None
@@ -65,7 +67,7 @@ class ToTEngine:
         self.llm_model = llm_model
         if OpenAI is not None:
             self.client = OpenAI(
-                api_key="sk-VWyPFNDXKVnTiItv66qXrJZIhfEb5kdxqPJoQ5ACHwDl0ulH",
+                api_key="sk-lGBrn5aWRZBPIEtNiUpIblgqBRdLfvephIJ71LBZWQEIp3kc",
                 # api_key="Empty",
                 base_url="https://openai.app.msh.team/v1" # Add proper base URL
             )
@@ -238,14 +240,14 @@ class ToTEngine:
                     {"id": "P2", "strategy": "probe middle", "start_s": 5, "end_s": 10},
                 ],
                 "direct_answer": None,
-                "confidence": 0.3, 
+                "evidence_confidence": 0.3, 
             }
             # Keep dialogue shape
             msgs.append({"role": "assistant", "content": json.dumps(dummy, ensure_ascii=False)})
             return dummy
 
         resp = self.client.chat.completions.create(
-            model="google/gemini-2.5-flash",
+            model="google/gemini-2.5-pro",
             temperature=self.temperature,
             messages=msgs,
         )
@@ -277,7 +279,7 @@ class ToTEngine:
                     "rationale": "JSON parse failure",
                     "proposed_paths": [],
                     "direct_answer": None,
-                    "confidence": 0.0,
+                    "evidence_confidence": 0.0,
                 }
 
         data.setdefault("proposed_paths", [])
@@ -300,7 +302,7 @@ class ToTEngine:
         nodes: List[PathNode] = []
         for i, p in enumerate(proposed):
             pid = str(p.get("id") or f"P{depth}_{i+1}")
-            strat = str(p.get("strategy") or "explore")
+            strat = str(p.get("strategy") or "expand")
             start_s = float(p.get("start_s", 0.0))
             end_s = float(p.get("end_s", max(0.1, min(duration, start_s + 5))))
             tool_type = str(p.get("tool_type", "global")).lower()
@@ -399,13 +401,12 @@ class ToTEngine:
             node = nodes[pid]
             if node.depth > self.max_depth:
                 continue
-
-            # Tool call: clip segment
-            # father_clip_result = node.father_clip_result if node.father_clip_result else 0.0            
+     
+            # Tool call: clip segment   
             if node.tool_type in ["global", "local"]:
                 clip_res = clip_video_segment(video_path, node.start_s, node.end_s, workdir=self.workdir, tool_type=node.tool_type)
             elif node.tool_type in ["slide"]:  
-                clip_res = clip_video_segment(video_path, node.father_clip_result.start_s, node.father_clip_result.end_s, workdir=self.workdir, tool_type=node.tool_type, stride=node.stride)
+                clip_res = clip_video_segment(video_path, node.father_start_s, node.father_end_s, workdir=self.workdir, tool_type=node.tool_type, stride=node.stride)
             node.clip_result = clip_res
             node.clip_result = clip_res
 
@@ -477,7 +478,7 @@ class ToTEngine:
             node.status = "processed"
             node.decision = node_decision.get("decision")
             node.rationale = node_decision.get("rationale")
-            node.confidence = node_decision.get("confidence", 0.0)
+            node.confidence = node_decision.get("evidence_confidence", 0.0)
 
             # Branch handling
             if node.decision == "discard":
@@ -493,7 +494,8 @@ class ToTEngine:
                     "start_s": node.start_s,
                     "end_s": node.end_s,
                     "strategy": node.strategy,
-                    "depth": node.depth
+                    "depth": node.depth,
+                    "evidence_confidence": node_decision.get("evidence_confidence", 0.0)
                 }
                 all_answers.append(answer_info)
                 node.direct_answer = node_decision.get("direct_answer")
@@ -501,7 +503,7 @@ class ToTEngine:
                 # 如果这是第一个答案，设置为final_answer
                 if final_answer is None:
                     final_answer = node_decision.get("direct_answer")
-                    confidence = node_decision.get("confidence", 0.0)
+                    confidence = node_decision.get("evidence_confidence", 0.0)
 
                 
                 
@@ -514,7 +516,7 @@ class ToTEngine:
             #     print(f"Path {node.path_id} chose to terminate")
             #     continue
 
-            if node.confidence < 3:
+            if node.confidence < 4 and node.confidence > 0:
                 continue
 
             if node.decision == "expand":
@@ -528,7 +530,8 @@ class ToTEngine:
                     depth=node.depth + 1,
                 )
                 for child in child_nodes:
-                    child.father_clip_result = node.clip_result  # 传递父节点的clip_result
+                    child.father_start_s = node.start_s  # 传递父节点的clip_result
+                    child.father_end_s = node.end_s
                     nodes[child.path_id] = child
                     node.children.append(child.path_id)
                     queue.append(child.path_id)
@@ -556,19 +559,19 @@ class ToTEngine:
                 "decision": n.decision,
                 "direct_answer": n.direct_answer,
                 "rationale": n.rationale,
-                "father_clip_path": n.father_clip_result.path if n.father_clip_result else None,  # 新增导出字段
-                "father_clip_result": n.father_clip_result,
+                "father_start_s": n.father_start_s,
+                "father_end_s": n.father_end_s,
                 "tool_type": n.tool_type,
                 "stride": n.stride,
                 "clip_path": n.clip_result.path if n.clip_result else None,
                 "children": n.children,
                 "messages": n.messages,
-                "confidence": n.confidence,
+                "evidence_confidence": n.confidence,
             }
         # import pdb; pdb.set_trace()
         return {
             "final_answer": result.final_answer,
-            "confidence": result.confidence,
+            "evidence_confidence": result.confidence,
             "terminated": result.terminated,
             "root_paths": result.root_paths,
             "nodes": out_nodes,

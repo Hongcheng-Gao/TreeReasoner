@@ -1,609 +1,371 @@
-# tot_engine_concurrent.py
+# run_videomme_concurrent.py
+"""
+并发处理Video-MME数据集的脚本
+
+输出路径配置选项：
+1. --data_dir: 默认输出目录（默认: ./videomme_results）
+2. --output_dir: 自定义输出目录（如果指定，会覆盖data_dir）
+3. --video_subdir_prefix: 视频子目录前缀（默认: videomme）
+
+使用示例：
+# 使用默认输出目录
+python run_videomme_concurrent.py
+
+# 自定义输出目录
+python run_videomme_concurrent.py --output_dir  /mnt/moonfs/kimiv-m2/huangzihao/eval/hongcheng_tot/qwen7b_base_videomme_v2
+
+# 自定义子目录前缀
+python run_videomme_concurrent.py --video_subdir_prefix "my_video"
+
+# 完整自定义
+python run_videomme_concurrent.py --output_dir /custom/path --video_subdir_prefix "test"
+"""
+import argparse
 import json
 import os
-import base64
-import io
-import threading
+import pandas as pd
 import time
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
-from moviepy.editor import VideoFileClip
-import numpy as np
-from PIL import Image
-from copy import deepcopy
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from typing import List, Dict, Any, Optional, Tuple
+from tqdm import tqdm
+import traceback
+from tot_engine_concurrent import ConcurrentToTEngine
 
-from tool_video import clip_video_segment, VideoClipResult, ensure_dir
-from prompts import ROOT_SYSTEM_PROMPT, build_root_user_prompt, build_node_user_prompt
-
-try:
-    from openai import OpenAI
-    from openai import APIError, APITimeoutError, RateLimitError, APIConnectionError
-except ImportError:
-    OpenAI = None
-    APIError = Exception
-    APITimeoutError = Exception
-    RateLimitError = Exception
-    APIConnectionError = Exception
-
-@dataclass
-class PathNode:
-    path_id: str
-    start_s: float
-    end_s: float
-    strategy: str
-    depth: int
-    parent_id: Optional[str] = None
-    tool_type: str = "global"  # global| local | slide
-    stride: float = 0.0  # Only for "slide" type
-    father_start_s: float = 0.0
-    father_end_s: float = 0.0
-    clip_result: Optional[VideoClipResult] = None
-    status: str = "pending"  # pending | processed | discarded
-    decision: Optional[str] = None
-    direct_answer: Optional[str] = None
-    rationale: Optional[str] = None
-    confidence: Optional[float] = None
-    children: List[str] = field(default_factory=list)
-    messages: Optional[List[Dict[str, str]]] = None
-
-@dataclass
-class ToTRunResult:
-    root_paths: List[str]
-    nodes: Dict[str, PathNode]
-    final_answer: Optional[str] = None
-    terminated: bool = False
-    all_answers: List[Dict[str, Any]] = field(default_factory=list)
-    confidence: Optional[float] = None
-
-class ConcurrentToTEngine:
-    """线程安全的ToT引擎，每个实例都有独立的状态"""
+class ConcurrentVideoMMEProcessor:
+    """高并发的Video-MME数据集处理器"""
     
-    def __init__(
-        self,
-        llm_model: str = "gpt-4o-mini",
-        api_key: Optional[str] = None,
-        max_depth: int = 3,
-        per_expand_limit: int = 3,
-        temperature: float = 0.2,
-        thread_safe: bool = True,
-    ):
-        self.max_depth = max_depth
-        self.per_expand_limit = per_expand_limit
-        self.temperature = temperature
-        self.thread_safe = thread_safe
-        self.thread_id = threading.get_ident() if thread_safe else None
+    def __init__(self, args, max_workers: int = 64):
+        self.args = args
+        self.max_workers = max_workers
+        self.results_lock = Lock()
+        self.progress_lock = Lock()
+        self.results = []
+        self.successful_count = 0
+        self.failed_count = 0
+        self.processed_count = 0
         
-        # 每个实例独立的客户端
-        self.client = None
-        self.llm_model = llm_model
-        if OpenAI is not None:
-            self.client = OpenAI(
-                api_key="Empty",
-                base_url="https://x35thinking-toyama-sft-hyy-base.app.msh.team/v1",
-                timeout=0.1  # 设置0.1秒超时
-            )
-
-        # 实例独立的状态 - 每次run都会重置
-        self.messages: List[Dict[str, str]] = []
-        self.frame_cache: Dict[str, List[Dict[str, Any]]] = {}
-        self.workdir: Optional[str] = None
+        # 确定有效的输出目录
+        self.output_dir = self._get_effective_output_dir()
         
-        # 线程安全锁（如果需要）
-        if thread_safe:
-            self._lock = threading.RLock()
+        # 预先创建输出目录
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        # 统计信息
+        self.stats = {
+            'start_time': None,
+            'end_time': None,
+            'total_videos': 0,
+            'successful': 0,
+            'failed': 0,
+            'errors': [],
+            'output_directory': self.output_dir
+        }
+    
+    def _get_effective_output_dir(self) -> str:
+        """获取有效的输出目录路径"""
+        if hasattr(self.args, 'output_dir') and self.args.output_dir:
+            # 如果指定了custom output_dir，使用它
+            return os.path.abspath(self.args.output_dir)
         else:
-            self._lock = None
-
-    def _thread_safe_operation(self, func, *args, **kwargs):
-        """线程安全操作包装器"""
-        if self._lock:
-            with self._lock:
-                return func(*args, **kwargs)
-        else:
-            return func(*args, **kwargs)
-
-    def _encode_video(self, video_path: str) -> str:
-        """
-        Encode a video file to base64 string.
-        """
+            # 否则使用data_dir
+            return os.path.abspath(self.args.data_dir)
+    
+    def get_video_output_dir(self, video_id: str) -> str:
+        """获取特定视频的输出目录路径"""
+        video_subdir_prefix = getattr(self.args, 'video_subdir_prefix', 'videomme')
+        return os.path.join(self.output_dir, f"{video_subdir_prefix}_{video_id}")
+    
+    def create_engine(self) -> ConcurrentToTEngine:
+        """为每个线程创建独立的ConcurrentToTEngine实例"""
+        return ConcurrentToTEngine(
+            llm_model=self.args.model,
+            api_key=self.args.api_key,
+            max_depth=self.args.max_depth,
+            per_expand_limit=self.args.per_expand_limit,
+            temperature=self.args.temperature,
+            thread_safe=True,
+        )
+    
+    def process_single_video(self, video_data: Tuple[int, pd.Series]) -> Optional[Dict[str, Any]]:
+        """处理单个视频的函数，用于并行执行"""
+        orig_idx, row = video_data
+        dataset_path = "/mnt/moonfs/kimiv-m2/huangzihao/dataset/videomme"
+        
         try:
-            with open(video_path, "rb") as video_file:
-                encoded_string = base64.b64encode(video_file.read()).decode('utf-8')
-                return encoded_string
-        except Exception as e:
-            print(f"Warning: Failed to encode video {video_path}: {e}")
-            return ""
-
-    def _extract_initial_frames(self, video_path: str, fps: float = 10.0) -> List[Dict[str, Any]]:
-        """
-        Extract frames from video at specified fps and store them with timestamps.
-        线程安全版本 - 使用实例级缓存
-        """
-        # 检查实例级缓存
-        if video_path in self.frame_cache:
-            return self.frame_cache[video_path]
+            # 为每个线程创建独立的engine
+            engine = self.create_engine()
             
-        frames_data = []
+            # 构建视频路径
+            video_filename = row["videoID"] + ".mp4"
+            video_path = os.path.join(dataset_path, "data", video_filename)
+            
+            # 检查视频文件是否存在
+            if not os.path.exists(video_path):
+                with self.progress_lock:
+                    print(f"Video file not found: {video_path}, skipping...")
+                return None
+            
+            # 创建输出目录
+            video_name = row["videoID"]
+            video_output_dir = self.get_video_output_dir(video_name)
+            os.makedirs(video_output_dir, exist_ok=True)
+            
+            # 准备问题
+            question = row["question"]
+            options = row.get("options")
+            if options is not None and len(options) > 0:
+                if isinstance(options, list):
+                    options_str = " ".join(options)
+                else:
+                    options_str = str(options)
+                question = question + " " + options_str
+            
+            # 获取真实答案
+            answer = row["answer"]
+            
+            # 处理视频
+            result = engine.run(video_path, question)
+            tree = engine.export_tree(result)
+            
+            # 创建结果条目
+            entry_result = {
+                "video_id": row["video_id"],
+                "question_id": row.get("question_id"),
+                "videoID": row["videoID"],
+                "video_path": video_path,
+                "question": question,
+                "ground_truth_answer": answer,
+                "domain": row.get("domain"),
+                "sub_category": row.get("sub_category"),
+                "task_type": row.get("task_type"),
+                "duration": row.get("duration"),
+                "final_answer": result.final_answer,
+                "terminated": result.terminated,
+                "total_nodes": len(result.nodes),
+                "all_answers": result.all_answers,
+                "total_answers": len(result.all_answers),
+                "reasoning_tree": tree,
+                "dataset": "Video-MME",
+                "original_index": orig_idx,
+                "processing_thread": threading.current_thread().name
+            }
+            
+            # 保存个别结果文件
+            individual_result_path = os.path.join(video_output_dir, "result.json")
+            with open(individual_result_path, "w", encoding="utf-8") as f:
+                json.dump(entry_result, f, ensure_ascii=False, indent=2)
+            
+            # 保存推理树
+            tree_path = os.path.join(video_output_dir, "tree.json")
+            with open(tree_path, "w", encoding="utf-8") as f:
+                json.dump(tree, f, ensure_ascii=False, indent=2)
+            
+            # 更新进度信息
+            with self.progress_lock:
+                self.successful_count += 1
+                thread_name = threading.current_thread().name
+                print(f"[{thread_name}] ✓ Processed {video_name} | Success: {self.successful_count}")
+                print(f"[{thread_name}] Final answer: {result.final_answer}")
+                print(f"[{thread_name}] Ground truth: {answer}")
+                print(f"[{thread_name}] Nodes: {len(result.nodes)}, Answers: {len(result.all_answers)}")
+            
+            return entry_result
+            
+        except Exception as e:
+            error_info = {
+                'video_id': row.get("videoID", "unknown"),
+                'original_index': orig_idx,
+                'error': str(e),
+                'traceback': traceback.format_exc(),
+                'thread': threading.current_thread().name
+            }
+            
+            with self.progress_lock:
+                self.failed_count += 1
+                self.stats['errors'].append(error_info)
+                thread_name = threading.current_thread().name
+                print(f"[{thread_name}] ✗ Error processing {row.get('videoID', 'unknown')}: {e}")
+                print(f"[{thread_name}] Failed: {self.failed_count}")
+            
+            return None
+    
+    def process_batch(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        """批量处理视频数据"""
+        self.stats['start_time'] = time.time()
+        self.stats['total_videos'] = len(df)
         
-        try:
-            with VideoFileClip(video_path) as clip:
-                duration = clip.duration
-                print(f"[Thread {self.thread_id}] Video duration: {duration}s, fps: {clip.fps}")
-                
-                interval = 1.0 / fps
-                timestamp = 0.0
-                
-                while timestamp <= duration:
+        print(f"Starting concurrent processing with {self.max_workers} workers...")
+        print(f"Total videos to process: {len(df)}")
+        
+        # 准备视频数据
+        video_data_list = [(orig_idx, row) for orig_idx, row in df.iterrows()]
+        
+        # 使用ThreadPoolExecutor进行并发处理
+        with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="VideoWorker") as executor:
+            # 提交所有任务
+            future_to_video = {
+                executor.submit(self.process_single_video, video_data): video_data[0] 
+                for video_data in video_data_list
+            }
+            
+            # 使用tqdm显示进度条
+            with tqdm(total=len(video_data_list), desc="Processing videos", unit="video") as pbar:
+                for future in as_completed(future_to_video):
+                    orig_idx = future_to_video[future]
                     try:
-                        frame = clip.get_frame(timestamp)
-                        pil_image = Image.fromarray(frame.astype('uint8'))
+                        result = future.result()
+                        if result is not None:
+                            with self.results_lock:
+                                self.results.append(result)
                         
-                        buffer = io.BytesIO()
-                        pil_image.save(buffer, format='JPEG')
-                        img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-                        
-                        frames_data.append({
-                            "base64": f"data:image/jpeg;base64,{img_base64}",
-                            "timestamp": timestamp
-                        })
-                        
-                        timestamp += interval
+                        with self.progress_lock:
+                            self.processed_count += 1
+                            pbar.set_postfix({
+                                'Success': self.successful_count,
+                                'Failed': self.failed_count,
+                                'Rate': f"{(self.successful_count/self.processed_count)*100:.1f}%" if self.processed_count > 0 else "0%"
+                            })
                         
                     except Exception as e:
-                        print(f"Warning: Failed to extract frame at {timestamp}s: {e}")
-                        timestamp += interval
-                        continue
-                        
-        except Exception as e:
-            print(f"Error processing video {video_path}: {e}")
-            
-        # 存储到实例级缓存
-        self.frame_cache[video_path] = frames_data
-        return frames_data
-
-    def _find_nearest_frame(self, target_timestamp: float, available_frames: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Find the frame with timestamp closest to the target timestamp."""
-        if not available_frames:
-            return None
-            
-        closest_frame = min(available_frames, key=lambda f: abs(f["timestamp"] - target_timestamp))
-        return closest_frame
-
-    def _extract_frames_with_timestamps(self, video_path: str, start_s: float = None, end_s: float = None) -> List[Dict[str, Any]]:
-        """
-        Extract 16 frames evenly spaced within the specified time interval.
-        """
-        # 获取可用帧
-        available_frames = self.frame_cache.get(video_path, [])
-        if not available_frames:
-            available_frames = self._extract_initial_frames(video_path)
+                        with self.progress_lock:
+                            self.failed_count += 1
+                            print(f"Future execution error for video index {orig_idx}: {e}")
+                    
+                    pbar.update(1)
         
-        if start_s is None or end_s is None:
-            return available_frames
+        self.stats['end_time'] = time.time()
+        self.stats['successful'] = self.successful_count
+        self.stats['failed'] = self.failed_count
         
-        # 选择16帧
-        target_frames = []
-        num_frames = 16
-        
-        if end_s <= start_s:
-            end_s = start_s + 0.1
-        
-        interval_duration = end_s - start_s
-        frame_interval = interval_duration / (num_frames - 1) if num_frames > 1 else 0
-        
-        for i in range(num_frames):
-            target_timestamp = start_s + (i * frame_interval)
-            nearest_frame = self._find_nearest_frame(target_timestamp, available_frames)
-            
-            if nearest_frame:
-                frame_copy = nearest_frame.copy()
-                frame_copy["original_timestamp"] = nearest_frame["timestamp"]
-                frame_copy["target_timestamp"] = target_timestamp
-                target_frames.append(frame_copy)
-        
-        return target_frames
-
-    def _chat_to_json(self, messages: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
-        """
-        Send messages to the LLM and parse a strict JSON response.
-        线程安全版本 - 使用独立的消息副本
-        """
-        use_global = messages is None
-        if use_global:
-            msgs = deepcopy(self.messages)  # 使用深拷贝避免状态污染
+        return self.results
+    
+    def save_results(self, results: List[Dict[str, Any]]):
+        """保存最终结果和统计信息"""
+        # 确定结果文件名
+        if self.args.start_row is not None and self.args.end_row is not None:
+            results_filename = f"videomme_concurrent_results_rows_{self.args.start_row}_{self.args.end_row-1}.json"
+            stats_filename = f"videomme_concurrent_stats_rows_{self.args.start_row}_{self.args.end_row-1}.json"
         else:
-            msgs = deepcopy(messages)
-
-        if self.client is None:
-            # Offline fallback
-            dummy = {
-                "decision": "expand",
-                "rationale": "Offline fallback: propose probing paths.",
-                "proposed_paths": [
-                    {"id": "P1", "strategy": "probe beginning", "start_s": 0, "end_s": 5},
-                    {"id": "P2", "strategy": "probe middle", "start_s": 5, "end_s": 10},
-                ],
-                "direct_answer": None,
-                "evidence_confidence": 0.3, 
-            }
-            
-            # 更新相应的消息列表
-            if use_global:
-                self.messages.append({"role": "assistant", "content": json.dumps(dummy, ensure_ascii=False)})
-            else:
-                messages.append({"role": "assistant", "content": json.dumps(dummy, ensure_ascii=False)})
-            return dummy
-
-        # 实现重试逻辑
-        max_retries = 20
-        retry_count = 0
+            results_filename = "videomme_concurrent_overall_results.json"
+            stats_filename = "videomme_concurrent_overall_stats.json"
         
-        while retry_count <= max_retries:
-            try:
-                resp = self.client.chat.completions.create(
-                    model="x35thinking-toyama-sft-hyy-base",
-                    temperature=self.temperature,
-                    messages=msgs,
-                )
-                text = resp.choices[0].message.content.strip()
-
-                # 更新相应的消息列表
-                if use_global:
-                    self.messages.append({"role": "assistant", "content": text})
-                else:
-                    messages.append({"role": "assistant", "content": text})
-                
-                # 解析JSON
-                raw_text = text
-                import re
-                match = re.search(r'<\s*TOOL_CALL\s*>(.*?)<\s*/\s*TOOL_CALL\s*>', raw_text, re.DOTALL)
-                text = match.group(1) if match else ''
-
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    data = None
-                    if "```" in text:
-                        parts = text.split("```")
-                        for i in range(len(parts)):
-                            try:
-                                data = json.loads(parts[i])
-                                break
-                            except Exception:
-                                continue
-                    if data is None:
-                        data = {
-                            "decision": "terminate",
-                            "rationale": "JSON parse failure",
-                            "proposed_paths": [],
-                            "direct_answer": None,
-                            "evidence_confidence": 0.0,
-                        }
-
-                data.setdefault("proposed_paths", [])
-                data.setdefault("direct_answer", None)
-                data.setdefault("rationale", "")
-                data.setdefault("decision", "terminate")
-                return data
-                
-            except (APIError, APITimeoutError, APIConnectionError, RateLimitError) as e:
-                retry_count += 1
-                if retry_count <= max_retries:
-                    print(f"[Thread {self.thread_id}] API error (attempt {retry_count}/{max_retries + 1}): {e}")
-                    time.sleep(0.1)  # 等待0.1秒后重试
-                    continue
-                else:
-                    print(f"[Thread {self.thread_id}] Max retries exceeded. API error: {e}")
-                    break
-            except Exception as e:
-                retry_count += 1
-                if retry_count <= max_retries:
-                    print(f"[Thread {self.thread_id}] Unexpected error (attempt {retry_count}/{max_retries + 1}): {e}")
-                    time.sleep(0.1)  # 等待0.1秒后重试
-                    continue
-                else:
-                    print(f"[Thread {self.thread_id}] Max retries exceeded. Unexpected error: {e}")
-                    break
+        # 保存结果
+        overall_results_path = os.path.join(self.output_dir, results_filename)
+        with open(overall_results_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
         
-        # 如果所有重试都失败，返回默认响应
-        print(f"[Thread {self.thread_id}] All retry attempts failed")
-        return {
-            "decision": "terminate",
-            "rationale": f"LLM call failed after {max_retries + 1} attempts",
-            "proposed_paths": [],
-            "direct_answer": None,
-            "evidence_confidence": 0.0,
-        }
-
-    def _video_meta(self, video_path: str) -> Dict[str, Any]:
-        """获取视频元数据"""
-        with VideoFileClip(video_path) as clip:
-            return {
-                "duration": float(clip.duration),
-                "fps": float(clip.fps) if clip.fps else None,
-                "width": int(clip.w),
-                "height": int(clip.h),
-                "path": video_path,
-            }
-
-    def _sanitize_paths(self, proposed: List[Dict[str, Any]], parent_id: Optional[str], duration: float, depth: int) -> List[PathNode]:
-        """清理和验证提议的路径"""
-        nodes: List[PathNode] = []
-        for i, p in enumerate(proposed):
-            pid = str(p.get("id") or f"P{depth}_{i+1}")
-            strat = str(p.get("strategy") or "expand")
-            start_s = float(p.get("start_s", 0.0))
-            end_s = float(p.get("end_s", max(0.1, min(duration, start_s + 5))))
-            tool_type = str(p.get("tool_type", "global")).lower()
-            stride = float(p.get("stride", 0.0))
-            
-            if start_s < 0:
-                start_s = 0.0
-            if end_s <= start_s:
-                end_s = min(duration, start_s + 2.0)
-            end_s = min(end_s, duration)
-            
-            node = PathNode(
-                path_id=pid,
-                start_s=start_s,
-                end_s=end_s,
-                strategy=strat,
-                depth=depth,
-                parent_id=parent_id,
-                tool_type=tool_type,
-                stride=stride,
-            )
-            nodes.append(node)
-        return nodes
-
-    def run(self, video_path: str, question: str) -> ToTRunResult:
-        """
-        主要的运行方法 - 线程安全版本
-        每次运行都重置实例状态
-        """
-        # 重置实例状态
-        self.messages = []
-        self.frame_cache = {}
+        # 计算处理时间和速度
+        total_time = self.stats['end_time'] - self.stats['start_time']
+        videos_per_second = self.stats['successful'] / total_time if total_time > 0 else 0
         
-        # 设置视频特定的工作目录
-        video_dir = os.path.dirname(video_path)
-        video_filename = os.path.basename(video_path)
-        video_name = os.path.splitext(video_filename)[0]
+        # 更新统计信息
+        self.stats.update({
+            'total_time_seconds': total_time,
+            'videos_per_second': videos_per_second,
+            'success_rate': (self.stats['successful'] / self.stats['total_videos']) * 100 if self.stats['total_videos'] > 0 else 0,
+            'max_workers': self.max_workers
+        })
         
-        # 创建线程特定的工作目录
-        thread_suffix = f"_t{self.thread_id}" if self.thread_id else ""
-        self.workdir = os.path.join(video_dir, f"{video_name}_work{thread_suffix}")
-        ensure_dir(self.workdir)
+        # 保存统计信息
+        stats_path = os.path.join(self.output_dir, stats_filename)
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(self.stats, f, ensure_ascii=False, indent=2)
         
-        print(f"[Thread {self.thread_id}] Processing {video_name} in {self.workdir}")
+        print(f"\n=== Concurrent Processing Summary ===")
+        print(f"Total videos: {self.stats['total_videos']}")
+        print(f"Successful: {self.stats['successful']}")
+        print(f"Failed: {self.stats['failed']}")
+        print(f"Success rate: {self.stats['success_rate']:.1f}%")
+        print(f"Total time: {total_time:.2f} seconds")
+        print(f"Processing speed: {videos_per_second:.2f} videos/second")
+        print(f"Max workers: {self.max_workers}")
+        print(f"Results saved to: {overall_results_path}")
+        print(f"Statistics saved to: {stats_path}")
         
-        try:
-            meta = self._video_meta(video_path)
+        if self.stats['errors']:
+            print(f"Errors encountered: {len(self.stats['errors'])}")
+            print("Check stats file for detailed error information")
 
-            # 提取初始帧
-            frames_data = self._extract_initial_frames(video_path, fps=10.0)
-            
-            # 构建帧内容
-            frame_content = []
-            init_segment_frames = self._extract_frames_with_timestamps(
-                video_path, 
-                start_s=0, 
-                end_s=meta["duration"]
-            )
 
-            for frame_info in init_segment_frames:
-                frame_content.append({"type": "image_url", "image_url": {"url": frame_info["base64"]}})
-                frame_content.append({"type": "text", "text": f"timestamp: {frame_info['timestamp']}s"})
+def run_videomme_concurrent(args):
+    """并发处理Video-MME数据集的主函数"""
+    
+    # 读取parquet文件
+    parquet_path = "/mnt/moonfs/kimiv-m2/huangzihao/dataset/videomme/videomme/test-00000-of-00001.parquet"
+    
+    print(f"Loading Video-MME parquet file: {parquet_path}")
+    df = pd.read_parquet(parquet_path)
+    print(f"Found {len(df)} Video-MME entries")
+    
+    if len(df) == 0:
+        print("No Video-MME entries found, skipping...")
+        return []
+    
+    # 应用行数范围过滤（如果指定）
+    if args.start_row is not None and args.end_row is not None:
+        print(f"Processing rows {args.start_row} to {args.end_row-1}")
+        df = df.iloc[args.start_row:args.end_row]
+        print(f"Filtered to {len(df)} entries")
+    
+    # 确定最佳worker数量
+    max_workers = getattr(args, 'max_workers', 64)
+    if max_workers > len(df):
+        max_workers = len(df)
+    
+    # 创建并发处理器
+    processor = ConcurrentVideoMMEProcessor(args, max_workers=max_workers)
+    
+    # 处理视频
+    results = processor.process_batch(df)
+    
+    # 保存结果
+    processor.save_results(results)
+    
+    return results
 
-            frame_content.append({"type": "text", "text": build_root_user_prompt(meta, question, max_paths=self.per_expand_limit)})
-            
-            # 初始化对话
-            self.messages = [
-                {"role": "system", "content": ROOT_SYSTEM_PROMPT},
-                {"role": "user", "content": frame_content},
-            ]
 
-            # 根规划
-            root_decision = self._chat_to_json()
-            nodes: Dict[str, PathNode] = {}
-            root_paths: List[str] = []
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--workdir", default="./work", help="Base working directory")
+    parser.add_argument("--model", default="gpt-4o-mini", help="LLM model name")
+    parser.add_argument("--max_depth", type=int, default=3)
+    parser.add_argument("--per_expand_limit", type=int, default=3)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--api_key", default=os.getenv("OPENAI_API_KEY"))
+    parser.add_argument("--save_tree", default="./tree.json", help="Path to save the reasoning tree JSON")
+    
+    # Video-MME specific arguments
+    parser.add_argument("--data_dir", default="./videomme_results", help="Base output directory for all results")
+    parser.add_argument("--output_dir", help="Custom output directory (overrides data_dir if provided)")
+    parser.add_argument("--video_subdir_prefix", default="videomme", help="Prefix for individual video subdirectories")
+    
+    # 行数范围参数
+    parser.add_argument("--start_row", type=int, help="Start row index (inclusive)")
+    parser.add_argument("--end_row", type=int, help="End row index (exclusive)")
+    
+    # 并发参数
+    parser.add_argument("--max_workers", type=int, default=64, help="Maximum number of concurrent workers")
+    parser.add_argument("--batch_size", type=int, default=100, help="Batch size for result saving")
+    
+    args = parser.parse_args()
+    
+    # 确定有效的输出目录
+    effective_output_dir = args.output_dir if hasattr(args, 'output_dir') and args.output_dir else args.data_dir
+    effective_output_dir = os.path.abspath(effective_output_dir)
+    
+    print(f"Starting concurrent Video-MME processing with {args.max_workers} workers...")
+    print(f"Output directory: {effective_output_dir}")
+    if args.start_row is not None and args.end_row is not None:
+        print(f"Processing rows {args.start_row}-{args.end_row-1}")
+    
+    # 处理Video-MME数据集
+    videomme_results = run_videomme_concurrent(args)
+    
+    print(f"\n=== Final Results ===")
+    print(f"Total successful Video-MME results: {len(videomme_results)}")
 
-            if root_decision.get("decision") == "answer":
-                all_answers = [{
-                    "path_id": "root",
-                    "answer": root_decision.get("direct_answer"),
-                    "rationale": root_decision.get("rationale", "")
-                }]
-                return ToTRunResult(root_paths=[], nodes=nodes, final_answer=root_decision.get("direct_answer"), terminated=True, all_answers=all_answers)
-            
-            if root_decision.get("decision") == "terminate":
-                return ToTRunResult(root_paths=[], nodes=nodes, final_answer=None, terminated=True, all_answers=[])
 
-            proposed = root_decision.get("proposed_paths", [])[: self.per_expand_limit]
-            initial_nodes = self._sanitize_paths(proposed, parent_id=None, duration=meta["duration"], depth=1)
-            for n in initial_nodes:
-                nodes[n.path_id] = n
-                root_paths.append(n.path_id)
-
-            # 收集所有找到的答案
-            all_answers = []
-            final_answer = None
-            terminated = False
-            confidence = None
-
-            # 根对话历史快照
-            root_history = deepcopy(self.messages)
-
-            # 顺序扩展
-            queue = list(root_paths)
-
-            while queue:
-                pid = queue.pop(0)
-                node = nodes[pid]
-                if node.depth > self.max_depth:
-                    continue
-         
-                # 工具调用：剪辑片段
-                try:
-                    if node.tool_type in ["global", "local"]:
-                        clip_res = clip_video_segment(video_path, node.start_s, node.end_s, workdir=self.workdir, tool_type=node.tool_type)
-                    elif node.tool_type in ["slide"]:  
-                        clip_res = clip_video_segment(video_path, node.father_start_s, node.father_end_s, workdir=self.workdir, tool_type=node.tool_type, stride=node.stride)
-                    node.clip_result = clip_res
-                except Exception as e:
-                    print(f"[Thread {self.thread_id}] Error clipping video segment: {e}")
-                    continue
-
-                # 构建本地线程
-                if node.parent_id is None:
-                    local_messages = deepcopy(root_history)
-                else:
-                    parent = nodes[node.parent_id]
-                    local_messages = deepcopy(parent.messages) if parent.messages is not None else deepcopy(root_history)
-
-                # 提取片段帧
-                segment_frames = self._extract_frames_with_timestamps(
-                    video_path, 
-                    start_s=clip_res.start_s, 
-                    end_s=clip_res.end_s
-                )
-                
-                # 构建片段内容
-                segment_content = []
-                for frame_info in segment_frames:
-                    segment_content.append({"type": "image_url", "image_url": {"url": frame_info["base64"]}})
-                    if 'original_timestamp' in frame_info:
-                        timestamp_text = f"timestamp: {frame_info['original_timestamp']:.2f}s"
-                    else:
-                        timestamp_text = f"timestamp: {frame_info.get('target_timestamp', frame_info['timestamp']):.2f}s"
-                    segment_content.append({"type": "text", "text": timestamp_text})
-                
-                segment_content.append({"type": "text", "text": build_node_user_prompt(
-                    path_id=node.path_id,
-                    strategy=node.strategy,
-                    start_s=node.start_s,
-                    end_s=node.end_s,
-                    clip_path=clip_res.path,
-                    duration=clip_res.duration,
-                    max_paths=self.per_expand_limit
-                )})
-
-                local_messages.append({
-                    "role": "user",
-                    "content": segment_content
-                })
-
-                # 获取节点决策
-                node_decision = self._chat_to_json(messages=local_messages)
-
-                # 保存本地线程到节点
-                node.messages = local_messages
-
-                # 更新节点状态
-                node.status = "processed"
-                node.decision = node_decision.get("decision")
-                node.rationale = node_decision.get("rationale")
-                node.confidence = node_decision.get("evidence_confidence", 0.0)
-
-                # 分支处理
-                if node.decision == "discard":
-                    node.status = "discarded"
-                    continue
-
-                if node.decision == "answer":
-                    answer_info = {
-                        "path_id": node.path_id,
-                        "answer": node_decision.get("direct_answer"),
-                        "rationale": node_decision.get("rationale", ""),
-                        "start_s": node.start_s,
-                        "end_s": node.end_s,
-                        "strategy": node.strategy,
-                        "depth": node.depth,
-                        "evidence_confidence": node_decision.get("evidence_confidence", 0.0)
-                    }
-                    all_answers.append(answer_info)
-                    node.direct_answer = node_decision.get("direct_answer")
-                    
-                    if final_answer is None:
-                        final_answer = node_decision.get("direct_answer")
-                        confidence = node_decision.get("evidence_confidence", 0.0)
-
-                    print(f"[Thread {self.thread_id}] Found answer from path {node.path_id}: {node_decision.get('direct_answer')}")
-                    continue
-
-                if node.confidence and node.confidence < 4 and node.confidence > 0:
-                    continue
-
-                if node.decision == "expand":
-                    if node.depth >= self.max_depth:
-                        print(f"[Thread {self.thread_id}] Path {node.path_id} reached max depth {self.max_depth}")
-                        continue
-                    
-                    child_nodes = self._sanitize_paths(
-                        node_decision.get("proposed_paths", [])[: self.per_expand_limit],
-                        parent_id=node.path_id,
-                        duration=meta["duration"],
-                        depth=node.depth + 1,
-                    )
-                    for child in child_nodes:
-                        child.father_start_s = node.start_s
-                        child.father_end_s = node.end_s
-                        nodes[child.path_id] = child
-                        node.children.append(child.path_id)
-                        queue.append(child.path_id)
-
-            # 设置结果状态
-            if all_answers:
-                terminated = True
-                print(f"[Thread {self.thread_id}] Exploration completed. Found {len(all_answers)} answers.")
-            else:
-                print(f"[Thread {self.thread_id}] Exploration completed. No answers found.")
-
-            return ToTRunResult(
-                root_paths=root_paths, 
-                nodes=nodes, 
-                final_answer=final_answer, 
-                terminated=terminated, 
-                all_answers=all_answers, 
-                confidence=confidence
-            )
-            
-        except Exception as e:
-            print(f"[Thread {self.thread_id}] Error in run method: {e}")
-            import traceback
-            traceback.print_exc()
-            return ToTRunResult(root_paths=[], nodes={}, final_answer=None, terminated=True, all_answers=[])
-
-    @staticmethod
-    def export_tree(result: ToTRunResult) -> Dict[str, Any]:
-        """导出推理树"""
-        out_nodes = {}
-        for pid, n in result.nodes.items():
-            out_nodes[pid] = {
-                "path_id": n.path_id,
-                "parent_id": n.parent_id,
-                "strategy": n.strategy,
-                "start_s": n.start_s,
-                "end_s": n.end_s,
-                "status": n.status,
-                "decision": n.decision,
-                "direct_answer": n.direct_answer,
-                "rationale": n.rationale,
-                "father_start_s": n.father_start_s,
-                "father_end_s": n.father_end_s,
-                "tool_type": n.tool_type,
-                "stride": n.stride,
-                "clip_path": n.clip_result.path if n.clip_result else None,
-                "children": n.children,
-                "messages": n.messages,
-                "evidence_confidence": n.confidence,
-            }
-        
-        return {
-            "final_answer": result.final_answer,
-            "evidence_confidence": result.confidence,
-            "terminated": result.terminated,
-            "root_paths": result.root_paths,
-            "nodes": out_nodes,
-            "all_answers": result.all_answers,
-        } 
+if __name__ == "__main__":
+    main() 

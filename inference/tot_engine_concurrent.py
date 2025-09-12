@@ -4,6 +4,7 @@ import os
 import base64
 import io
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from moviepy.editor import VideoFileClip
@@ -16,8 +17,13 @@ from prompts import ROOT_SYSTEM_PROMPT, build_root_user_prompt, build_node_user_
 
 try:
     from openai import OpenAI
+    from openai import APIError, APITimeoutError, RateLimitError, APIConnectionError
 except ImportError:
     OpenAI = None
+    APIError = Exception
+    APITimeoutError = Exception
+    RateLimitError = Exception
+    APIConnectionError = Exception
 
 @dataclass
 class PathNode:
@@ -73,7 +79,8 @@ class ConcurrentToTEngine:
         if OpenAI is not None:
             self.client = OpenAI(
                 api_key="Empty",
-                base_url="https://x35thinking-toyama-sft-hyy-base.app.msh.team/v1"
+                base_url="https://x35thinking-toyama-sft-hyy-base.app.msh.team/v1",
+                timeout=0.1  # 设置0.1秒超时
             )
 
         # 实例独立的状态 - 每次run都会重置
@@ -227,62 +234,86 @@ class ConcurrentToTEngine:
                 messages.append({"role": "assistant", "content": json.dumps(dummy, ensure_ascii=False)})
             return dummy
 
-        try:
-            resp = self.client.chat.completions.create(
-                model="x35thinking-toyama-sft-hyy-base",
-                temperature=self.temperature,
-                messages=msgs,
-            )
-            text = resp.choices[0].message.content.strip()
-
-            # 更新相应的消息列表
-            if use_global:
-                self.messages.append({"role": "assistant", "content": text})
-            else:
-                messages.append({"role": "assistant", "content": text})
-            
-            # 解析JSON
-            raw_text = text
-            import re
-            match = re.search(r'<\s*TOOL_CALL\s*>(.*?)<\s*/\s*TOOL_CALL\s*>', raw_text, re.DOTALL)
-            text = match.group(1) if match else ''
-
+        # 实现重试逻辑
+        max_retries = 20
+        retry_count = 0
+        
+        while retry_count <= max_retries:
             try:
-                data = json.loads(text)
-            except Exception:
-                data = None
-                if "```" in text:
-                    parts = text.split("```")
-                    for i in range(len(parts)):
-                        try:
-                            data = json.loads(parts[i])
-                            break
-                        except Exception:
-                            continue
-                if data is None:
-                    data = {
-                        "decision": "terminate",
-                        "rationale": "JSON parse failure",
-                        "proposed_paths": [],
-                        "direct_answer": None,
-                        "evidence_confidence": 0.0,
-                    }
+                resp = self.client.chat.completions.create(
+                    model="x35thinking-toyama-sft-hyy-base",
+                    temperature=self.temperature,
+                    messages=msgs,
+                )
+                text = resp.choices[0].message.content.strip()
 
-            data.setdefault("proposed_paths", [])
-            data.setdefault("direct_answer", None)
-            data.setdefault("rationale", "")
-            data.setdefault("decision", "terminate")
-            return data
-            
-        except Exception as e:
-            print(f"[Thread {self.thread_id}] Error in LLM call: {e}")
-            return {
-                "decision": "terminate",
-                "rationale": f"LLM call failed: {str(e)}",
-                "proposed_paths": [],
-                "direct_answer": None,
-                "evidence_confidence": 0.0,
-            }
+                # 更新相应的消息列表
+                if use_global:
+                    self.messages.append({"role": "assistant", "content": text})
+                else:
+                    messages.append({"role": "assistant", "content": text})
+                
+                # 解析JSON
+                raw_text = text
+                import re
+                match = re.search(r'<\s*TOOL_CALL\s*>(.*?)<\s*/\s*TOOL_CALL\s*>', raw_text, re.DOTALL)
+                text = match.group(1) if match else ''
+
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = None
+                    if "```" in text:
+                        parts = text.split("```")
+                        for i in range(len(parts)):
+                            try:
+                                data = json.loads(parts[i])
+                                break
+                            except Exception:
+                                continue
+                    if data is None:
+                        data = {
+                            "decision": "terminate",
+                            "rationale": "JSON parse failure",
+                            "proposed_paths": [],
+                            "direct_answer": None,
+                            "evidence_confidence": 0.0,
+                        }
+
+                data.setdefault("proposed_paths", [])
+                data.setdefault("direct_answer", None)
+                data.setdefault("rationale", "")
+                data.setdefault("decision", "terminate")
+                return data
+                
+            except (APIError, APITimeoutError, APIConnectionError, RateLimitError) as e:
+                retry_count += 1
+                if retry_count <= max_retries:
+                    print(f"[Thread {self.thread_id}] API error (attempt {retry_count}/{max_retries + 1}): {e}")
+                    time.sleep(0.1)  # 等待0.1秒后重试
+                    continue
+                else:
+                    print(f"[Thread {self.thread_id}] Max retries exceeded. API error: {e}")
+                    break
+            except Exception as e:
+                retry_count += 1
+                if retry_count <= max_retries:
+                    print(f"[Thread {self.thread_id}] Unexpected error (attempt {retry_count}/{max_retries + 1}): {e}")
+                    time.sleep(0.1)  # 等待0.1秒后重试
+                    continue
+                else:
+                    print(f"[Thread {self.thread_id}] Max retries exceeded. Unexpected error: {e}")
+                    break
+        
+        # 如果所有重试都失败，返回默认响应
+        print(f"[Thread {self.thread_id}] All retry attempts failed")
+        return {
+            "decision": "terminate",
+            "rationale": f"LLM call failed after {max_retries + 1} attempts",
+            "proposed_paths": [],
+            "direct_answer": None,
+            "evidence_confidence": 0.0,
+        }
 
     def _video_meta(self, video_path: str) -> Dict[str, Any]:
         """获取视频元数据"""
